@@ -1,0 +1,444 @@
+"""
+MLA attention kernel microbenchmark: FlashMLA (sgl_kernel) vs trtllm-gen (flashinfer).
+
+WHY THIS EXISTS
+---------------
+Mentor's claim: "On B300, FlashMLA is much slower than trtllm-gen in the CP
+scenario." CP (context parallel) itself is a *model-level* concern (the latent-KV
+all-gather lives in deepseek_v2.py, not in either kernel). Once CP has gathered
+the KV, what actually runs is a plain MLA attention kernel. So the real question
+reduces to a kernel-vs-kernel comparison under long-context shapes:
+
+    decode  : flashmla `flash_mla_with_kvcache`      vs  trtllm-gen `trtllm_batch_decode_with_kv_cache_mla`
+    prefill : flashinfer ragged (what flashmla falls  vs  trtllm-gen `trtllm_ragged_attention_deepseek`
+              back to)
+
+This script times each kernel in isolation, cross-checks numerical agreement so
+the comparison is apples-to-apples, and (optionally) emits a Chrome trace you can
+feed to the `llm-torch-profiler-analysis` skill.
+
+SHAPES (DeepSeek-V3 MLA, absorbed decode form)
+----------------------------------------------
+    kv_lora_rank      = 512
+    qk_nope_head_dim  = 128
+    qk_rope_head_dim  = 64
+    head_dim (decode q / kv) = kv_lora_rank + qk_rope_head_dim = 576   <-- kernel sees 576
+    head_dim_v (decode out)  = kv_lora_rank                   = 512
+    softmax_scale     = (qk_nope_head_dim + qk_rope_head_dim) ** -0.5 = 192**-0.5
+    page/block size   = 64   (both backends support 64)
+    h_q               = num_attention_heads // TP   (128 for TP=1)
+    h_kv              = 1    (MLA = MQA against the shared latent)
+
+Prefill uses the non-absorbed form: q/k head_dim = 192, v head_dim = 128.
+
+USAGE
+-----
+    # decode sweep (the regime the mentor cares about: long context, q_len=1)
+    python bench_mla_kernels.py --mode decode \
+        --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --dtype bf16
+
+    # prefill sweep
+    python bench_mla_kernels.py --mode prefill \
+        --batch 1 --seq-q 2048 8192 --heads 128 --dtype bf16
+
+    # both, and dump a chrome trace for the profiler skill
+    python bench_mla_kernels.py --mode both --trace trace_mla.json
+
+Run this ON THE B300 box (needs CUDA + torch + sgl_kernel + flashinfer).
+"""
+
+from __future__ import annotations
+
+import argparse
+import math
+from dataclasses import dataclass
+from typing import Callable, Optional
+
+import torch
+
+# ----- MLA constants (DeepSeek-V3) -----
+KV_LORA_RANK = 512
+QK_NOPE_HEAD_DIM = 128
+QK_ROPE_HEAD_DIM = 64
+HEAD_DIM_CKV = KV_LORA_RANK + QK_ROPE_HEAD_DIM  # 576  (decode q & kv last dim)
+HEAD_DIM_V = KV_LORA_RANK  # 512  (decode output)
+HEAD_DIM_QK = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 192 (prefill q/k)
+SOFTMAX_SCALE = HEAD_DIM_QK ** -0.5  # scaling is on the *original* 192, not 576
+PAGE_SIZE = 64
+
+_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+
+# --------------------------------------------------------------------------- #
+# Capability detection / optional imports
+# --------------------------------------------------------------------------- #
+def device_cap() -> tuple[int, int]:
+    return torch.cuda.get_device_capability()
+
+
+def try_import_flashmla():
+    try:
+        from sgl_kernel.flash_mla import flash_mla_with_kvcache, get_mla_metadata
+
+        return flash_mla_with_kvcache, get_mla_metadata
+    except Exception as e:  # noqa: BLE001
+        print(f"[skip] flashmla unavailable: {e}")
+        return None, None
+
+
+def try_import_flashinfer():
+    try:
+        import flashinfer
+
+        return flashinfer
+    except Exception as e:  # noqa: BLE001
+        print(f"[skip] flashinfer unavailable: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Timing harness: CUDA events, warmup, L2 flush between iters
+# --------------------------------------------------------------------------- #
+@dataclass
+class TimeResult:
+    name: str
+    ok: bool
+    ms: float = float("nan")
+    note: str = ""
+
+
+def _l2_flush(buf: torch.Tensor) -> None:
+    # write the whole buffer to evict L2 so each iter starts cold (kernel-fair)
+    buf.zero_()
+
+
+def time_kernel(
+    name: str,
+    fn: Callable[[], torch.Tensor],
+    iters: int = 50,
+    warmup: int = 10,
+) -> TimeResult:
+    try:
+        for _ in range(warmup):
+            fn()
+        torch.cuda.synchronize()
+
+        flush_buf = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device="cuda")
+        starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+        for i in range(iters):
+            _l2_flush(flush_buf)
+            starts[i].record()
+            fn()
+            ends[i].record()
+        torch.cuda.synchronize()
+        times = sorted(s.elapsed_time(e) for s, e in zip(starts, ends))
+        # median is robust to the occasional scheduling hiccup
+        return TimeResult(name=name, ok=True, ms=times[len(times) // 2])
+    except Exception as e:  # noqa: BLE001
+        return TimeResult(name=name, ok=False, note=repr(e))
+
+
+# --------------------------------------------------------------------------- #
+# Shared paged-KV builder (so both backends attend to identical data)
+# --------------------------------------------------------------------------- #
+def build_decode_inputs(b, s_q, s_k, h_q, dtype, device="cuda", seed=0):
+    torch.manual_seed(seed)
+    cache_seqlens = torch.full((b,), s_k, dtype=torch.int32, device=device)
+    max_seqlen_pad = ((s_k + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    num_blocks_per = max_seqlen_pad // PAGE_SIZE
+
+    # absorbed-form query: head_dim = 576
+    q = (torch.randn(b, s_q, h_q, HEAD_DIM_CKV, dtype=dtype, device=device) / 10).clamp_(-1, 1)
+
+    block_table = torch.arange(
+        b * num_blocks_per, dtype=torch.int32, device=device
+    ).view(b, num_blocks_per)
+
+    # latent KV, h_kv = 1, last dim 576. h_kv axis is size-1 so the two backend
+    # layouts (.., block, 1, 576) and (.., 1, block, 576) share memory.
+    kv_paged = (
+        torch.randn(b * num_blocks_per, PAGE_SIZE, HEAD_DIM_CKV, dtype=dtype, device=device) / 10
+    ).clamp_(-1, 1)
+    return q, kv_paged, block_table, cache_seqlens, max_seqlen_pad
+
+
+# --------------------------------------------------------------------------- #
+# DECODE runners
+# --------------------------------------------------------------------------- #
+def make_flashmla_decode(q, kv_paged, block_table, cache_seqlens, h_q):
+    flash_mla_with_kvcache, get_mla_metadata = try_import_flashmla()
+    if flash_mla_with_kvcache is None:
+        return None
+    b, s_q = q.shape[0], q.shape[1]
+    k_cache = kv_paged.unsqueeze(2)  # (num_blocks, PAGE_SIZE, 1, 576)
+    tile_md, num_splits = get_mla_metadata(
+        cache_seqlens, s_q * h_q // 1, 1, h_q, False, None
+    )
+
+    def run():
+        out, _ = flash_mla_with_kvcache(
+            q,
+            k_cache,
+            block_table,
+            cache_seqlens,
+            HEAD_DIM_V,  # head_dim_v = 512
+            tile_md,
+            num_splits,
+            softmax_scale=SOFTMAX_SCALE,
+            causal=True,
+        )
+        return out  # (b, s_q, h_q, 512)
+
+    return run
+
+
+def make_trtllm_decode(q, kv_paged, block_table, cache_seqlens, max_seq_len):
+    fi = try_import_flashinfer()
+    if fi is None:
+        return None
+    kv_cache = kv_paged.unsqueeze(1)  # (num_blocks, 1, PAGE_SIZE, 576)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    bmm1_scale = SOFTMAX_SCALE  # q_scale * k_scale * softmax_scale; bf16 => 1*1*scale
+
+    def run():
+        return fi.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q,  # (b, s_q, h_q, 576)
+            kv_cache=kv_cache,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+            kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            block_tables=block_table,
+            seq_lens=cache_seqlens,
+            max_seq_len=int(max_seq_len),
+            bmm1_scale=bmm1_scale,
+            # backend defaults to "trtllm-gen"
+        )
+
+    return run
+
+
+# --------------------------------------------------------------------------- #
+# PREFILL runners (non-absorbed form: q/k head_dim=192, v head_dim=128)
+# --------------------------------------------------------------------------- #
+def build_prefill_inputs(b, s_q, h_q, dtype, device="cuda", seed=0):
+    torch.manual_seed(seed)
+    total_q = b * s_q
+    q = (torch.randn(total_q, h_q, HEAD_DIM_QK, dtype=dtype, device=device) / 10).clamp_(-1, 1)
+    k = (torch.randn(total_q, h_q, HEAD_DIM_QK, dtype=dtype, device=device) / 10).clamp_(-1, 1)
+    v = (torch.randn(total_q, h_q, QK_NOPE_HEAD_DIM, dtype=dtype, device=device) / 10).clamp_(-1, 1)
+    cu = torch.arange(0, (b + 1) * s_q, s_q, dtype=torch.int32, device=device)
+    seq_lens = torch.full((b,), s_q, dtype=torch.int32, device=device)
+    return q, k, v, cu, seq_lens
+
+
+def make_trtllm_prefill(q, k, v, cu, seq_lens, b, s_q):
+    fi = try_import_flashinfer()
+    if fi is None:
+        return None
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+
+    def run():
+        return fi.prefill.trtllm_ragged_attention_deepseek(
+            query=q,
+            key=k,
+            value=v,
+            workspace_buffer=workspace,
+            seq_lens=seq_lens,
+            max_q_len=s_q,
+            max_kv_len=s_q,
+            bmm1_scale=SOFTMAX_SCALE,
+            bmm2_scale=1.0,
+            o_sf_scale=-1.0,
+            batch_size=b,
+            window_left=-1,
+            cum_seq_lens_q=cu,
+            cum_seq_lens_kv=cu,
+            enable_pdl=False,
+            is_causal=True,
+            return_lse=False,
+        )
+
+    return run
+
+
+def make_flashinfer_ragged_prefill(q, k, v, cu, seq_lens, b, s_q):
+    """What the flashmla backend actually falls back to for pure prefill."""
+    fi = try_import_flashinfer()
+    if fi is None:
+        return None
+    try:
+        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+        wrapper = fi.BatchPrefillWithRaggedKVCacheWrapper(workspace, "NHD")
+        wrapper.plan(
+            qo_indptr=cu,
+            kv_indptr=cu,
+            num_qo_heads=q.shape[1],
+            num_kv_heads=k.shape[1],
+            head_dim_qk=HEAD_DIM_QK,
+            head_dim_vo=QK_NOPE_HEAD_DIM,
+            causal=True,
+            sm_scale=SOFTMAX_SCALE,
+            q_data_type=q.dtype,
+        )
+
+        def run():
+            return wrapper.run(q, k, v)
+
+        return run
+    except Exception as e:  # noqa: BLE001
+        print(f"[skip] flashinfer ragged wrapper setup failed: {e}")
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# Correctness cross-check (cosine similarity, fp-tolerant)
+# --------------------------------------------------------------------------- #
+def cos_diff(x: torch.Tensor, y: torch.Tensor) -> float:
+    x, y = x.double().flatten(), y.double().flatten()
+    return (1 - 2 * (x * y).sum() / max((x * x + y * y).sum().item(), 1e-12)).item()
+
+
+# --------------------------------------------------------------------------- #
+# Drivers
+# --------------------------------------------------------------------------- #
+def run_decode(args):
+    dtype = _DTYPES[args.dtype]
+    rows = []
+    print("\n=== DECODE (q_len=1 absorbed MLA, head_dim 576 -> 512) ===")
+    print(f"{'B':>4} {'S_K':>7} {'H':>4} | {'flashmla(ms)':>13} {'trtllm(ms)':>12} "
+          f"{'speedup':>8} {'cos_diff':>10}")
+    for b in args.batch:
+        for s_k in args.seq_k:
+            for h in args.heads:
+                q, kv, bt, cs, max_pad = build_decode_inputs(b, 1, s_k, h, dtype)
+                fm = make_flashmla_decode(q, kv, bt, cs, h)
+                tg = make_trtllm_decode(q, kv, bt, cs, s_k)
+
+                out_fm = out_tg = None
+                r_fm = time_kernel("flashmla", lambda: _capture(fm, "out_fm")) if fm else TimeResult("flashmla", False, note="unavailable")
+                r_tg = time_kernel("trtllm", lambda: _capture(tg, "out_tg")) if tg else TimeResult("trtllm", False, note="unavailable")
+                # one extra call to grab outputs for the cross-check
+                if fm:
+                    out_fm = fm()
+                if tg:
+                    out_tg = tg()
+
+                cd = float("nan")
+                if out_fm is not None and out_tg is not None:
+                    cd = cos_diff(out_fm.reshape(b, h, -1), out_tg.reshape(b, h, -1))
+
+                sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
+                print(f"{b:>4} {s_k:>7} {h:>4} | {_fmt(r_fm):>13} {_fmt(r_tg):>12} "
+                      f"{sp:>8.2f} {cd:>10.2e}")
+                rows.append((b, s_k, h, r_fm, r_tg, sp, cd))
+    return rows
+
+
+def run_prefill(args):
+    dtype = _DTYPES[args.dtype]
+    print("\n=== PREFILL (ragged, non-absorbed head_dim 192/128, causal) ===")
+    print(f"{'B':>4} {'S_Q':>7} {'H':>4} | {'fi_ragged(ms)':>14} {'trtllm(ms)':>12} "
+          f"{'speedup':>8} {'cos_diff':>10}")
+    rows = []
+    for b in args.batch:
+        for s_q in args.seq_q:
+            for h in args.heads:
+                q, k, v, cu, sl = build_prefill_inputs(b, s_q, h, dtype)
+                fi_run = make_flashinfer_ragged_prefill(q, k, v, cu, sl, b, s_q)
+                tg_run = make_trtllm_prefill(q, k, v, cu, sl, b, s_q)
+
+                r_fi = time_kernel("fi_ragged", fi_run) if fi_run else TimeResult("fi_ragged", False, note="unavailable")
+                r_tg = time_kernel("trtllm", tg_run) if tg_run else TimeResult("trtllm", False, note="unavailable")
+
+                out_fi = fi_run() if fi_run else None
+                out_tg = tg_run() if tg_run else None
+                cd = float("nan")
+                if out_fi is not None and out_tg is not None:
+                    o_tg = out_tg[0] if isinstance(out_tg, (tuple, list)) else out_tg
+                    cd = cos_diff(out_fi.reshape(b * s_q, h, -1), o_tg.reshape(b * s_q, h, -1))
+
+                sp = (r_fi.ms / r_tg.ms) if (r_fi.ok and r_tg.ok) else float("nan")
+                print(f"{b:>4} {s_q:>7} {h:>4} | {_fmt(r_fi):>14} {_fmt(r_tg):>12} "
+                      f"{sp:>8.2f} {cd:>10.2e}")
+                rows.append((b, s_q, h, r_fi, r_tg, sp, cd))
+    return rows
+
+
+# small helpers
+_CAP = {}
+
+
+def _capture(fn, key):
+    out = fn()
+    _CAP[key] = out
+    return out
+
+
+def _fmt(r: TimeResult) -> str:
+    return f"{r.ms:.3f}" if r.ok else "n/a"
+
+
+def maybe_trace(args, fn):
+    """Wrap a single representative call in torch.profiler -> chrome trace."""
+    if not args.trace:
+        fn()
+        return
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        fn()
+        torch.cuda.synchronize()
+    prof.export_chrome_trace(args.trace)
+    print(f"\n[trace] wrote {args.trace}  "
+          f"-> feed to the `llm-torch-profiler-analysis` skill")
+
+
+def main():
+    p = argparse.ArgumentParser()
+    p.add_argument("--mode", choices=["decode", "prefill", "both"], default="decode")
+    p.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16])
+    p.add_argument("--seq-k", type=int, nargs="+", default=[4096, 16384, 32768],
+                   help="decode KV length (long-context regime)")
+    p.add_argument("--seq-q", type=int, nargs="+", default=[2048, 8192],
+                   help="prefill query length")
+    p.add_argument("--heads", type=int, nargs="+", default=[128],
+                   help="q heads after TP (128 for TP=1, 16 for TP=8, ...)")
+    p.add_argument("--dtype", choices=list(_DTYPES), default="bf16")
+    p.add_argument("--trace", type=str, default=None,
+                   help="export a chrome trace of one representative iter")
+    args = p.parse_args()
+
+    if not torch.cuda.is_available():
+        raise SystemExit("CUDA required. Run on the B300 box.")
+    maj, minr = device_cap()
+    print(f"device: {torch.cuda.get_device_name()}  SM {maj}.{minr}  "
+          f"torch {torch.__version__}")
+    print(f"note: flashmla decode is gated to SM90 (Hopper) in sgl-kernel; "
+          f"trtllm-gen MLA targets SM100/120 (Blackwell). On B300 (SM10x) "
+          f"watch whether flashmla even has a native dense-decode path.")
+
+    if args.mode in ("decode", "both"):
+        run_decode(args)
+    if args.mode in ("prefill", "both"):
+        run_prefill(args)
+
+    if args.trace:
+        # trace the long-context decode case (the mentor's regime)
+        dtype = _DTYPES[args.dtype]
+        q, kv, bt, cs, max_pad = build_decode_inputs(
+            args.batch[0], 1, args.seq_k[-1], args.heads[0], dtype
+        )
+        tg = make_trtllm_decode(q, kv, bt, cs, args.seq_k[-1])
+        fm = make_flashmla_decode(q, kv, bt, cs, args.heads[0])
+        target = fm or tg
+        if target:
+            for _ in range(5):
+                target()
+            torch.cuda.synchronize()
+            maybe_trace(args, target)
+
+
+if __name__ == "__main__":
+    main()
