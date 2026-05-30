@@ -8,7 +8,7 @@
 
 ### 1. Where this started
 
-The mentor's claim:
+Someone's claim:
 
 > *"On B300, FlashMLA is much slower than trtllm-gen in the CP (Context
 > Parallel) scenario. First confirm the claim, then profile to find the
@@ -152,7 +152,7 @@ Constants: `kv_lora_rank=512`, `qk_nope_head_dim=128`, `qk_rope_head_dim=64`,
 
 ### 1. 起点
 
-导师的说法：
+有些人说：
 
 > *"在 B300 上，CP（Context Parallel，上下文并行）场景下 FlashMLA 比 trtllm-gen
 > 慢很多。先确认这个 claim，然后 profile 找出差异，再优化 FlashMLA。"*
