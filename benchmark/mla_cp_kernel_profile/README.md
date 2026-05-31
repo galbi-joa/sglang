@@ -1,6 +1,6 @@
 # MLA attention kernel profiling: FlashMLA vs trtllm-gen (CP scenario)
 
-Goal: turn the mentor's claim — *"on B300, FlashMLA is much slower than
+Goal: turn this claim — *"on B300, FlashMLA is much slower than
 trtllm-gen in the CP scenario"* — into measured numbers, split cleanly by
 phase (prefill vs decode).
 
@@ -48,7 +48,7 @@ Two facts worth keeping in front of you while reading results:
 ```bash
 cd benchmark/mla_cp_kernel_profile
 
-# 1) Decode sweep — the regime the mentor cares about (long KV, q_len=1)
+# 1) Decode sweep long KV, q_len=1
 python bench_mla_kernels.py --mode decode \
     --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --dtype bf16
 
