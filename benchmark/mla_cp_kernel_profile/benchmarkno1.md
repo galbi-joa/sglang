@@ -8,15 +8,11 @@
 
 ### 1. Where this started
 
-Someone's claim:
+There is a claim:
 
 > *"On B300, FlashMLA is much slower than trtllm-gen in the CP (Context
 > Parallel) scenario. First confirm the claim, then profile to find the
 > difference, then optimize FlashMLA."*
-
-Before we can profile anything, we had to answer a chain of "what does this
-actually mean in SGLang?" questions. This note records the reasoning so the
-benchmark files don't look like they appeared out of nowhere.
 
 ### 2. The chain of facts we established (in order)
 
@@ -75,8 +71,8 @@ decode anyway.
 
 Putting (d)–(f) together:
 
-- CP is the *stage*, not the thing being measured. The thing the mentor calls
-  "slow" is the **attention kernel** that runs inside a CP deployment.
+- What we need to measure is the **attention kernel** that runs inside a CP
+  deployment.
 - The fair, decisive comparison is **kernel vs kernel**, split by phase:
 
 | phase | FlashMLA backend runs | trtllm_mla backend runs |
@@ -152,13 +148,10 @@ Constants: `kv_lora_rank=512`, `qk_nope_head_dim=128`, `qk_rope_head_dim=64`,
 
 ### 1. 起点
 
-有些人说：
+有这么一个 claim：
 
 > *"在 B300 上，CP（Context Parallel，上下文并行）场景下 FlashMLA 比 trtllm-gen
 > 慢很多。先确认这个 claim，然后 profile 找出差异，再优化 FlashMLA。"*
-
-在做任何 profile 之前，我们必须先回答一连串"这在 SGLang 里到底是什么意思？"的
-问题。这份笔记记录了推理过程，这样这些 benchmark 文件就不会看起来像是凭空冒出来的。
 
 ### 2. 我们依次确认的事实链
 
@@ -212,8 +205,7 @@ decode 路径不受影响，因为 CP 在 decode 之前本来就会清空它的�
 
 把 (d)–(f) 合起来：
 
-- CP 是*舞台*，不是被测量的对象。导师说"慢"的那个东西是在 CP 部署里运行的
-  **attention kernel**。
+- 我们需要测量的对象是在 CP 部署里运行的 **attention kernel**。
 - 公平、决定性的对比是**按阶段拆分的 kernel 对 kernel**：
 
 | 阶段 | FlashMLA 后端运行 | trtllm_mla 后端运行 |
