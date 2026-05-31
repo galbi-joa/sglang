@@ -17,8 +17,9 @@ CP deployment is slow"**, and the fair test is kernel-vs-kernel:
 
 | phase | FlashMLA backend runs | trtllm_mla backend runs |
 |-------|-----------------------|-------------------------|
-| decode  | `sgl_kernel.flash_mla.flash_mla_with_kvcache` (DeepSeek FlashMLA) | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` (backend="trtllm-gen") |
-| prefill | falls back to `flashinfer` ragged (`super().forward_extend`) | `flashinfer.prefill.trtllm_ragged_attention_deepseek` |
+| decode | `sgl_kernel.flash_mla.flash_mla_with_kvcache` (DeepSeek FlashMLA) | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` (backend="trtllm-gen") |
+| prefill (absorbed-MLA branch) | `flash_mla_with_kvcache` — the **same decode kernel**, q_len>1 | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` |
+| prefill (pure ragged branch) | falls back to `flashinfer` ragged (`super().forward_extend`) | `flashinfer.prefill.trtllm_ragged_attention_deepseek` |
 
 Two facts worth keeping in front of you while reading results:
 
@@ -28,10 +29,14 @@ Two facts worth keeping in front of you while reading results:
    test gates on `_REQUIRED_MAJOR = 12` (Blackwell). So on B300 (SM10x) FlashMLA
    dense decode may have no native fast path while trtllm-gen does — this is the
    #1 hypothesis for the slowdown.
-2. **prefill is mostly a flashinfer-vs-flashinfer comparison**, because FlashMLA
-   doesn't run its own kernel for pure prefill — it defers to the flashinfer
-   ragged wrapper. Differences there are about *which* flashinfer kernel the
-   backend selects, not about FlashMLA's `.cu` code.
+2. **Prefill is NOT just flashinfer-vs-flashinfer.** SGLang reuses the FlashMLA
+   *decode* kernel for prefill whenever dispatch returns
+   `AttnForwardMethod.MLA` (piecewise CUDA graph, prefill-CP,
+   `flashinfer_mla_disable_ragged`, or a prefix with chunked-prefix-cache
+   disabled). So absorbed-MLA prefill lands on the very same SM90-gated FlashMLA
+   decode kernel. Only *pure ragged* prefill defers to the flashinfer ragged
+   wrapper. The two regimes are benchmarked separately as `prefill_absorbed`
+   and `prefill_ragged`. (See benchmarkno1.md sections 3, 5b.)
 
 ## Files
 
@@ -52,16 +57,25 @@ cd benchmark/mla_cp_kernel_profile
 python bench_mla_kernels.py --mode decode \
     --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --dtype bf16
 
-# 2) Prefill sweep
-python bench_mla_kernels.py --mode prefill \
+# 2) Absorbed-MLA prefill: SGLang reuses the FlashMLA *decode* kernel for
+#    prefill (q_len>1) whenever dispatch picks AttnForwardMethod.MLA.
+python bench_mla_kernels.py --mode prefill_absorbed \
     --batch 1 --seq-q 2048 8192 16384 --heads 128 --dtype bf16
 
-# 3) Dump a chrome trace of the long-context decode case
+# 3) Pure ragged prefill (FlashMLA's fallback) vs trtllm-gen ragged
+python bench_mla_kernels.py --mode prefill_ragged \
+    --batch 1 --seq-q 2048 8192 16384 --heads 128 --dtype bf16
+
+# 4) Dump a chrome trace of the long-context decode case
 python bench_mla_kernels.py --mode decode --seq-k 32768 --batch 1 \
     --trace trace_decode_32k.json
 #    -> feed trace_decode_32k.json to the `llm-torch-profiler-analysis` skill
 
-# 4) End-to-end with CP actually enabled, per backend
+# 5) Run everything at once
+python bench_mla_kernels.py --mode all \
+    --batch 1 --seq-k 4096 16384 32768 --seq-q 2048 8192 --heads 128
+
+# 6) End-to-end with CP actually enabled, per backend
 BACKEND=flashmla    bash profile_e2e_cp.sh
 BACKEND=trtllm_mla  bash profile_e2e_cp.sh
 ```

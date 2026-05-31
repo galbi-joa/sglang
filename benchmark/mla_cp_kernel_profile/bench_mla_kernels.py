@@ -3,46 +3,68 @@ MLA attention kernel microbenchmark: FlashMLA (sgl_kernel) vs trtllm-gen (flashi
 
 WHY THIS EXISTS
 ---------------
-Mentor's claim: "On B300, FlashMLA is much slower than trtllm-gen in the CP
+There is a claim: "On B300, FlashMLA is much slower than trtllm-gen in the CP
 scenario." CP (context parallel) itself is a *model-level* concern (the latent-KV
 all-gather lives in deepseek_v2.py, not in either kernel). Once CP has gathered
 the KV, what actually runs is a plain MLA attention kernel. So the real question
-reduces to a kernel-vs-kernel comparison under long-context shapes:
+reduces to a kernel-vs-kernel comparison under long-context shapes.
 
-    decode  : flashmla `flash_mla_with_kvcache`      vs  trtllm-gen `trtllm_batch_decode_with_kv_cache_mla`
-    prefill : flashinfer ragged (what flashmla falls  vs  trtllm-gen `trtllm_ragged_attention_deepseek`
-              back to)
+KEY CORRECTION (matches benchmarkno1.md sections 3, 5b)
+-------------------------------------------------------
+FlashMLA does NOT only run on decode. SGLang reuses the **same** FlashMLA decode
+kernel (`flash_mla_with_kvcache` -> `fwd_kvcache_mla`) for a large part of
+*prefill* too: whenever the dispatch in
+`attention_backend_handler.py:_handle_attention_backend` returns
+`AttnForwardMethod.MLA` (absorbed) instead of `MHA_*` -- i.e. under piecewise
+CUDA graph, prefill-CP, `flashinfer_mla_disable_ragged`, or a prefix with
+chunked-prefix-cache disabled. Only *pure ragged* prefill (forward_mode==EXTEND,
+no prefix, ragged allowed) defers to a flashinfer ragged wrapper. So this script
+benchmarks three regimes:
+
+    decode            : flashmla `flash_mla_with_kvcache` (q_len=1)
+                        vs trtllm-gen `trtllm_batch_decode_with_kv_cache_mla`
+    prefill_absorbed  : flashmla `flash_mla_with_kvcache` (q_len>1, causal)  <-- decode kernel reused for prefill
+                        vs trtllm-gen `trtllm_batch_decode_with_kv_cache_mla`
+    prefill_ragged    : flashinfer ragged wrapper (flashmla's pure-prefill fallback)
+                        vs trtllm-gen `trtllm_ragged_attention_deepseek`
 
 This script times each kernel in isolation, cross-checks numerical agreement so
 the comparison is apples-to-apples, and (optionally) emits a Chrome trace you can
 feed to the `llm-torch-profiler-analysis` skill.
 
-SHAPES (DeepSeek-V3 MLA, absorbed decode form)
-----------------------------------------------
+SHAPES (DeepSeek-V3 MLA)
+------------------------
     kv_lora_rank      = 512
     qk_nope_head_dim  = 128
     qk_rope_head_dim  = 64
-    head_dim (decode q / kv) = kv_lora_rank + qk_rope_head_dim = 576   <-- kernel sees 576
-    head_dim_v (decode out)  = kv_lora_rank                   = 512
-    softmax_scale     = (qk_nope_head_dim + qk_rope_head_dim) ** -0.5 = 192**-0.5
     page/block size   = 64   (both backends support 64)
     h_q               = num_attention_heads // TP   (128 for TP=1)
     h_kv              = 1    (MLA = MQA against the shared latent)
 
-Prefill uses the non-absorbed form: q/k head_dim = 192, v head_dim = 128.
+  Absorbed form (decode AND absorbed-MLA prefill -- the kernel sees the latent):
+    head_dim (q / kv) = kv_lora_rank + qk_rope_head_dim = 576
+    head_dim_v (out)  = kv_lora_rank                   = 512
+    softmax_scale     = (qk_nope_head_dim + qk_rope_head_dim) ** -0.5 = 192**-0.5
+
+  Non-absorbed form (pure ragged prefill only):
+    q/k head_dim = 192, v head_dim = 128.
 
 USAGE
 -----
-    # decode sweep (the regime the mentor cares about: long context, q_len=1)
+    # decode sweep (long context, q_len=1)
     python bench_mla_kernels.py --mode decode \
         --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --dtype bf16
 
-    # prefill sweep
-    python bench_mla_kernels.py --mode prefill \
+    # absorbed-MLA prefill: FlashMLA decode kernel doing prefill work (q_len>1)
+    python bench_mla_kernels.py --mode prefill_absorbed \
         --batch 1 --seq-q 2048 8192 --heads 128 --dtype bf16
 
-    # both, and dump a chrome trace for the profiler skill
-    python bench_mla_kernels.py --mode both --trace trace_mla.json
+    # pure ragged prefill (flashmla's fallback) vs trtllm ragged
+    python bench_mla_kernels.py --mode prefill_ragged \
+        --batch 1 --seq-q 2048 8192 --heads 128 --dtype bf16
+
+    # everything, and dump a chrome trace for the profiler skill
+    python bench_mla_kernels.py --mode all --trace trace_mla.json
 
 Run this ON THE B300 box (needs CUDA + torch + sgl_kernel + flashinfer).
 """
@@ -336,9 +358,48 @@ def run_decode(args):
     return rows
 
 
-def run_prefill(args):
+def run_prefill_absorbed(args):
+    """Absorbed-MLA prefill: SGLang reuses the FlashMLA *decode* kernel for
+    prefill (q_len>1, causal) whenever dispatch returns AttnForwardMethod.MLA.
+    Same kernels as decode, only s_q>1 -- this is the regime the earlier draft
+    wrongly excluded."""
     dtype = _DTYPES[args.dtype]
-    print("\n=== PREFILL (ragged, non-absorbed head_dim 192/128, causal) ===")
+    rows = []
+    print("\n=== PREFILL (absorbed MLA: FlashMLA decode kernel reused, q_len>1, "
+          "head_dim 576 -> 512, causal) ===")
+    print(f"{'B':>4} {'S_Q':>7} {'S_K':>7} {'H':>4} | {'flashmla(ms)':>13} "
+          f"{'trtllm(ms)':>12} {'speedup':>8} {'cos_diff':>10}")
+    for b in args.batch:
+        for s_q in args.seq_q:
+            for h in args.heads:
+                # s_k == s_q: pure prefill (no cached prefix), causal self-attn.
+                q, kv, bt, cs, max_pad = build_decode_inputs(b, s_q, s_q, h, dtype)
+                fm = make_flashmla_decode(q, kv, bt, cs, h)
+                tg = make_trtllm_decode(q, kv, bt, cs, s_q)
+
+                r_fm = time_kernel("flashmla", lambda: _capture(fm, "out_fm")) if fm else TimeResult("flashmla", False, note="unavailable")
+                r_tg = time_kernel("trtllm", lambda: _capture(tg, "out_tg")) if tg else TimeResult("trtllm", False, note="unavailable")
+                out_fm = fm() if fm else None
+                out_tg = tg() if tg else None
+
+                cd = float("nan")
+                if out_fm is not None and out_tg is not None:
+                    cd = cos_diff(out_fm.reshape(b, h, -1), out_tg.reshape(b, h, -1))
+
+                sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
+                print(f"{b:>4} {s_q:>7} {s_q:>7} {h:>4} | {_fmt(r_fm):>13} "
+                      f"{_fmt(r_tg):>12} {sp:>8.2f} {cd:>10.2e}")
+                rows.append((b, s_q, h, r_fm, r_tg, sp, cd))
+    return rows
+
+
+def run_prefill_ragged(args):
+    """Pure ragged prefill: what FlashMLA falls back to when dispatch does NOT
+    pick absorbed MLA (forward_mode==EXTEND, no prefix, ragged allowed). Here it
+    is genuinely flashinfer-ragged vs trtllm-gen-ragged."""
+    dtype = _DTYPES[args.dtype]
+    print("\n=== PREFILL (pure ragged fallback, non-absorbed head_dim 192/128, "
+          "causal) ===")
     print(f"{'B':>4} {'S_Q':>7} {'H':>4} | {'fi_ragged(ms)':>14} {'trtllm(ms)':>12} "
           f"{'speedup':>8} {'cos_diff':>10}")
     rows = []
@@ -397,7 +458,13 @@ def maybe_trace(args, fn):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--mode", choices=["decode", "prefill", "both"], default="decode")
+    p.add_argument(
+        "--mode",
+        choices=["decode", "prefill_absorbed", "prefill_ragged", "all"],
+        default="decode",
+        help="decode | prefill_absorbed (FlashMLA decode kernel reused for "
+        "prefill) | prefill_ragged (pure flashinfer fallback) | all",
+    )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--seq-k", type=int, nargs="+", default=[4096, 16384, 32768],
                    help="decode KV length (long-context regime)")
@@ -419,10 +486,12 @@ def main():
           f"trtllm-gen MLA targets SM100/120 (Blackwell). On B300 (SM10x) "
           f"watch whether flashmla even has a native dense-decode path.")
 
-    if args.mode in ("decode", "both"):
+    if args.mode in ("decode", "all"):
         run_decode(args)
-    if args.mode in ("prefill", "both"):
-        run_prefill(args)
+    if args.mode in ("prefill_absorbed", "all"):
+        run_prefill_absorbed(args)
+    if args.mode in ("prefill_ragged", "all"):
+        run_prefill_ragged(args)
 
     if args.trace:
         # trace the long-context decode case (the mentor's regime)
