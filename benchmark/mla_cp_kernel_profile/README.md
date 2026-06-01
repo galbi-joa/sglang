@@ -95,6 +95,44 @@ matching the deployment you're comparing.
 - A row printing `n/a` means that backend's kernel was unavailable or raised on
   this device/shape — itself a finding (e.g. FlashMLA has no path for B300).
 
+## Running on B300 (Blackwell / SM 10.3) — required setup
+
+Measured 2026-06-01. Two environment facts bite here:
+
+1. **trtllm-gen needs CUDA toolkit 13.** flashinfer JIT-compiles the trtllm-gen
+   kernel for `compute_103a`; nvcc 12.8 does not know SM103 and fails with
+   `Unsupported gpu architecture 'compute_103a'`. The driver (580.x) already
+   supports CUDA 13, so install the toolkit only:
+   ```bash
+   # Ubuntu 24.04, driver already CUDA-13-capable
+   wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+   dpkg -i cuda-keyring_1.1-1_all.deb && apt-get update
+   apt-get install -y cuda-toolkit-13-0     # NOT 'cuda' / 'cuda-13-0' (those touch the driver)
+   export PATH=/usr/local/cuda-13.0/bin:$PATH
+   export LD_LIBRARY_PATH=/usr/local/cuda-13.0/lib64:$LD_LIBRARY_PATH
+   rm -rf /root/.cache/flashinfer        # drop the failed 12.8 JIT cache
+   ```
+
+2. **FlashMLA needs sgl_kernel rebuilt from source with CUDA 13.** A pip
+   prebuilt `sgl_kernel` wheel is typically built under CUDA <= 12.8, so it has
+   **no sm100/sm103 binaries** and every flashmla call raises
+   `no kernel image is available`. `sgl-kernel/cmake/flashmla.cmake` *does*
+   compile SM100/SM103 when `CUDA_VERSION > 12.8` / `>= 13.0`, so rebuild:
+   ```bash
+   pip uninstall -y sgl-kernel
+   cd sgl-kernel && pip install --no-build-isolation .   # long; needs CUDA 13 nvcc
+   # success markers in the log: "Patched utils.h for SM103a support"
+   ```
+   After the rebuild, on B300 you get **sparse decode/prefill and dense
+   prefill**, but **dense decode is still absent** — `flashmla.cmake`'s SM100
+   block has no dense-decode source. That kernel would have to be written in the
+   external `sgl-project/FlashMLA` repo.
+
+So on B300 today: `--mode decode --dtype bf16/fp8` shows flashmla `n/a` (no
+dense decode), trtllm-gen runs. `--mode sparse_decode` is the FlashMLA path
+that B300 can support after the rebuild. See `benchmarkno1.md` section 4b and
+`worklog_2026-06-01.md`.
+
 ## Caveats
 
 - bf16 path uses `bmm1_scale = softmax_scale` (q/k descale = 1). For an FP8-KV

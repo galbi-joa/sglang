@@ -108,7 +108,43 @@ fast path**, while trtllm-gen has a Blackwell-optimized kernel in flashinfer.
 This is the leading explanation for "FlashMLA is much slower" and is exactly
 what the benchmark is designed to confirm or refute.
 
-### 5. The exact kernel I/O shapes (DeepSeek-V3 MLA)
+### 4b. B300 measured results (2026-06-01) — and an important correction
+
+We ran the benchmark on a real **NVIDIA B300 SXM6 (SM 10.3), torch 2.9.1+cu128**.
+
+**What we saw:**
+
+- `--dtype bf16` decode → flashmla `n/a`:
+  `BF16 Dense MLA is not supported on SM100`. trtllm-gen ran (~0.023 ms).
+- `--dtype fp8` decode → flashmla `CUDA error: no kernel image is available`
+  (`.../sm90/dense_fp8/...`). The fp8 dense binary is sm90-only.
+- trtllm-gen initially failed too: `nvcc fatal: Unsupported gpu architecture
+  'compute_103a'`. Root cause: the installed **CUDA toolkit was 12.8** (no
+  SM103), even though the **driver was 580.126 (CUDA 13 capable)**. Installing
+  `cuda-toolkit-13-0` fixed the JIT and **trtllm-gen now runs on B300**.
+
+**Correction (important): FlashMLA DOES support SM100 — but the wheel must be
+rebuilt.** `sgl-kernel/cmake/flashmla.cmake` compiles SM100 sources when
+`CUDA_VERSION > 12.8` and SM103 when `>= 13.0` (guarded by
+`FLASHMLA_ENABLE_SM100`). The `sgl_kernel` we had was a **pip prebuilt wheel
+built under CUDA <= 12.8**, so it shipped **no sm100/sm103 binaries** — hence
+`no kernel image`. Installing CUDA 13 only upgraded the JIT nvcc (for
+flashinfer); the prebuilt `sgl_kernel` wheel was unchanged. **Rebuilding
+sgl_kernel from source with CUDA 13 will include the SM100 kernels.**
+
+**But dense decode still won't exist even after a rebuild.** The
+`FLASHMLA_ENABLE_SM100` block lists, for SM100: dense **prefill**, sparse
+**prefill**, and sparse **decode** (`sm100/decode/.../{v32,model1}.cu`) — but
+**no dense decode source at all**. So a rebuild revives sparse decode/prefill
+and dense prefill on B300, while **dense decode remains absent in FlashMLA's
+own sources** and would have to be written.
+
+Net diagnosis of the claim: for **dense decode**, FlashMLA is not "slow" on
+B300 — it simply has no kernel; trtllm-gen is the only working path. For
+**sparse decode (DSA/V3.2)**, FlashMLA does support B300 but the wheel must be
+rebuilt with CUDA 13.
+
+
 
 Constants: `kv_lora_rank=512`, `qk_nope_head_dim=128`, `qk_rope_head_dim=64`,
 `v_head_dim=128`, page size `64`.
@@ -325,6 +361,39 @@ decode 路径不受影响，因为 CP 在 decode 之前本来就会清空它的�
 所以在 **B300（Blackwell，SM10x）** 上，FlashMLA dense decode 可能**没有原生的
 快速路径**，而 trtllm-gen 在 flashinfer 里有一个针对 Blackwell 优化的 kernel。
 这是"FlashMLA 慢很多"的首要解释，也正是这个 benchmark 要去确认或推翻的东西。
+
+### 4b. B300 实测结果（2026-06-01）—— 以及一个重要更正
+
+我们在真实的 **NVIDIA B300 SXM6（SM 10.3），torch 2.9.1+cu128** 上跑了 benchmark。
+
+**观察到的现象：**
+
+- `--dtype bf16` decode → flashmla 显示 `n/a`：
+  `BF16 Dense MLA is not supported on SM100`。trtllm-gen 能跑（约 0.023 ms）。
+- `--dtype fp8` decode → flashmla `CUDA error: no kernel image is available`
+  （`.../sm90/dense_fp8/...`）。fp8 dense 二进制只为 sm90 编译。
+- trtllm-gen 一开始也失败：`nvcc fatal: Unsupported gpu architecture
+  'compute_103a'`。根因：安装的 **CUDA toolkit 是 12.8**（不支持 SM103），尽管
+  **驱动已是 580.126（支持 CUDA 13）**。安装 `cuda-toolkit-13-0` 后 JIT 通过，
+  **trtllm-gen 在 B300 上能跑了**。
+
+**更正（重要）：FlashMLA 其实支持 SM100 —— 但需要重新编译 wheel。**
+`sgl-kernel/cmake/flashmla.cmake` 在 `CUDA_VERSION > 12.8` 时编译 SM100 源、
+在 `>= 13.0` 时编译 SM103（由 `FLASHMLA_ENABLE_SM100` 控制）。我们用的
+`sgl_kernel` 是 **pip 预编译 wheel，在 CUDA <= 12.8 下编译的**，所以**不含
+sm100/sm103 二进制** —— 因此报 `no kernel image`。装 CUDA 13 只是把 JIT 用的
+nvcc 升到了 13（给 flashinfer 用），预编译的 `sgl_kernel` wheel 没变。
+**用 CUDA 13 从源码重新编译 sgl_kernel，就会包含 SM100 kernel。**
+
+**但即使重编译，dense decode 仍然不存在。** `FLASHMLA_ENABLE_SM100` 块里，
+SM100 的源只有：dense **prefill**、sparse **prefill**、sparse **decode**
+（`sm100/decode/.../{v32,model1}.cu`）—— **完全没有 dense decode 源**。所以重编
+译能让 B300 上的 sparse decode/prefill 和 dense prefill 复活，而 **dense decode
+在 FlashMLA 自己的源码里就缺失**，需要自己写。
+
+对 claim 的最终诊断：对 **dense decode**，FlashMLA 在 B300 上不是"慢"，而是
+根本没有 kernel；trtllm-gen 是唯一能跑的路径。对 **sparse decode（DSA/V3.2）**，
+FlashMLA 确实支持 B300，但 wheel 必须用 CUDA 13 重新编译。
 
 ### 5. 精确的 kernel 输入/输出 shape（DeepSeek-V3 MLA）
 

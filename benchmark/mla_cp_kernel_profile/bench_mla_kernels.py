@@ -419,9 +419,20 @@ def make_flashmla_sparse_decode(q_fp8, kv_q, cache_seqlens, idx, h_q):
     if flash_mla_with_kvcache is None:
         return None, "flashmla unavailable"
     topk = idx.shape[-1]
+
+    # flashmla.cmake only instantiates SM100 sparse decode for head64 / head128
+    # (sm100/decode/head64/{v32,model1}.cu). dsa_backend.py pads num_heads up to
+    # a multiple of 64 (Hopper) or 128 (Blackwell) for exactly this reason; we
+    # mirror that here so a non-{64,128} head count doesn't hit a missing kernel.
+    maj = device_cap()[0]
+    pad_to = 128 if maj >= 10 else 64
+    h_pad = ((h_q + pad_to - 1) // pad_to) * pad_to
+    if h_pad != h_q:
+        q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, h_pad - h_q))
+
     try:
         tile_md, num_splits = get_mla_metadata(
-            cache_seqlens, 1 * h_q // 1, 1, h_q, True, topk
+            cache_seqlens, 1 * h_pad // 1, 1, h_pad, True, topk
         )
     except Exception as e:  # noqa: BLE001
         return None, _short_err(e)
