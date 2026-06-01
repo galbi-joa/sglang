@@ -1,8 +1,4 @@
-# Benchmark Note #1 — MLA Attention Kernel Profiling under the CP Scenario
-
-> English version first, 中文版本在下方.
-
----
+# Benchmark Note #1.1 — MLA Attention Kernel Profiling under the CP Scenario
 
 ## English
 
@@ -42,6 +38,7 @@ is the shared kernel toolbox.
 This was the single most important realization. The actual CP work — splitting
 the sequence across ranks and re-gathering the latent KV — happens at the model
 level:
+
 - `deepseek_v2.py:1819 rebuild_cp_kv_cache()` → `cp_all_gather_rerange_output(...)`
 - invoked from the absorbed-MLA prepare in `forward_mla.py:384`
 
@@ -75,11 +72,11 @@ Putting (d)–(f) together:
   deployment.
 - The fair, decisive comparison is **kernel vs kernel**, split by phase:
 
-| phase | FlashMLA backend runs | trtllm_mla backend runs |
-|-------|-----------------------|-------------------------|
-| decode  | `flash_mla_with_kvcache` (sgl_kernel, DeepSeek FlashMLA) | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` |
-| prefill (absorbed-MLA branch) | `flash_mla_with_kvcache` — the **same decode kernel** | `flashinfer.prefill.trtllm_ragged_attention_deepseek` |
-| prefill (pure ragged branch) | flashinfer ragged (via `super().forward_extend`) | `flashinfer.prefill.trtllm_ragged_attention_deepseek` |
+| phase                         | FlashMLA backend runs                                          | trtllm_mla backend runs                                     |
+| ----------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------- |
+| decode                        | `flash_mla_with_kvcache` (sgl_kernel, DeepSeek FlashMLA)     | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` |
+| prefill (absorbed-MLA branch) | `flash_mla_with_kvcache` — the **same decode kernel** | `flashinfer.prefill.trtllm_ragged_attention_deepseek`     |
+| prefill (pure ragged branch)  | flashinfer ragged (via `super().forward_extend`)             | `flashinfer.prefill.trtllm_ragged_attention_deepseek`     |
 
 - **Correction (important).** An earlier draft said "decode is the real
   battleground; prefill is just a flashinfer-vs-flashinfer comparison because
@@ -100,6 +97,7 @@ Putting (d)–(f) together:
 ### 4. The #1 hypothesis (architecture gating)
 
 Evidence from the build and tests:
+
 - `sgl-kernel/cmake/flashmla.cmake` builds FlashMLA **dense decode only for
   sm90 (Hopper)**; its sm100 source list is **sparse-only**.
 - `test_flashmla.py` gates on `is_sm90_supported` (SM90).
@@ -116,6 +114,7 @@ Constants: `kv_lora_rank=512`, `qk_nope_head_dim=128`, `qk_rope_head_dim=64`,
 `v_head_dim=128`, page size `64`.
 
 **Decode (absorbed MLA — the kernel sees the latent dim, not 192):**
+
 - q: `(B, 1, H, 576)` where `576 = kv_lora_rank + qk_rope = 512 + 64`
 - kv_cache: FlashMLA `(N_blk, 64, 1, 576)` vs trtllm-gen `(N_blk, 1, 64, 576)`
   (note the differing head-axis position / page layout)
@@ -123,17 +122,18 @@ Constants: `kv_lora_rank=512`, `qk_nope_head_dim=128`, `qk_rope_head_dim=64`,
 - softmax scale uses the original `192**-0.5`, not `576`.
 
 **Prefill (non-absorbed, ragged, causal):**
+
 - q/k: `(T, H, 192)`, v: `(T, H, 128)`, `cu_seqlens` ragged layout.
 
 ### 5b. DeepSeek Sparse Attention (DSA / V3.2) kernels
 
 The DSA backend (`dsa_backend.py`) selects one of three kernels by phase:
 
-| path | kernel | source |
-|------|--------|--------|
-| sparse prefill | `flash_mla_sparse_fwd` (`:1762`) | sgl_kernel (external FlashMLA) |
-| sparse decode  | `flash_mla_with_kvcache(..., indices=..., is_fp8_kvcache=True)` (`:1816`) | sgl_kernel (external FlashMLA) |
-| dense fallback | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` (`:2152`) / `trtllm_ragged_attention_deepseek` (`:1868`) | flashinfer trtllm-gen |
+| path           | kernel                                                                                                                     | source                         |
+| -------------- | -------------------------------------------------------------------------------------------------------------------------- | ------------------------------ |
+| sparse prefill | `flash_mla_sparse_fwd` (`:1762`)                                                                                       | sgl_kernel (external FlashMLA) |
+| sparse decode  | `flash_mla_with_kvcache(..., indices=..., is_fp8_kvcache=True)` (`:1816`)                                              | sgl_kernel (external FlashMLA) |
+| dense fallback | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` (`:2152`) / `trtllm_ragged_attention_deepseek` (`:1868`) | flashinfer trtllm-gen          |
 
 Two things matter here:
 
@@ -143,9 +143,11 @@ Two things matter here:
 2. **The same architecture gating reappears** (`dsa_backend.py:1737-1742`):
    the FlashMLA sparse kernel requires `num_heads` to be a multiple of **64 on
    Hopper but 128 on Blackwell**:
+
    ```python
    required_padding = 128 if self.device_sm_major >= 10 else 64
    ```
+
    When TP shrinks the head count below the multiple, q is zero-padded up to
    128 and trimmed afterward — extra wasted work that is *worse on B300*.
 
@@ -155,6 +157,7 @@ MLA does **not** store full K/V; it stores a compressed *latent* plus a small
 rope tail. There are up to two buffers:
 
 **(A) Main latent KV — `MLATokenToKVPool` (`memory_pool.py:1631`):**
+
 ```python
 self.kv_buffer = [
     torch.zeros((size + page_size, 1, kv_cache_dim), dtype=store_dtype, ...)
@@ -162,6 +165,7 @@ self.kv_buffer = [
 ]
 # kv_cache_dim = kv_lora_rank + qk_rope_head_dim = 512 + 64 = 576
 ```
+
 - Shape `(num_tokens, 1, 576)`. The head axis is **1** (MQA: all q-heads share
   one latent KV). This is the source of the decode kernel's
   `(N_blk, P, 1, 576)` layout.
@@ -170,17 +174,20 @@ self.kv_buffer = [
   memory** — V is just the nope part of the latent, K is the full latent.
 
 **(B) DSA-only indexer cache — `DSATokenToKVPool` (`memory_pool.py:1994`):**
+
 ```python
 self.index_k_with_scale_buffer = [...]  # dtype = uint8
 # per page: buf[:page_size*head_dim]            -> fp8 index_k data
 #           buf[page_size*head_dim:].view(f32)  -> per-token scale
 ```
+
 - `index_head_dim == 128` (fixed), page size **64** (fixed).
 - index_k is stored **fp8-quantized** with the scale packed in the same buffer.
 - The indexer uses index_k to pick top-k tokens; those indices are then applied
   to the latent KV in (A) for the sparse attention kernel.
 
 Storage flow:
+
 ```
 input K, V
   → compress to latent (kv_lora_rank 512 + rope 64 = 576)
@@ -201,13 +208,11 @@ input K, V
   same thing; optionally emits a Chrome trace for the
   `llm-torch-profiler-analysis` skill. A row printing `n/a` is itself a finding
   (that backend has no path on this device/shape).
-
 - **`benchmark/mla_cp_kernel_profile/profile_e2e_cp.sh`** — end-to-end
   validation. Launches a real DeepSeek server with
   `--enable-prefill-context-parallel` and captures a torch-profiler trace, so we
   can confirm the isolated microbench reflects an actual CP deployment and see
   which kernel each phase lands on.
-
 - **`benchmark/mla_cp_kernel_profile/README.md`** — usage and result-reading
   guide.
 
@@ -257,6 +262,7 @@ kernel 工具箱。
 **(d) CP 是模型层的事，不是 kernel 的功能。**
 这是最重要的一个认知。真正的 CP 工作 —— 把序列切分到各个 rank、再把 latent KV
 重新汇总 —— 发生在模型层：
+
 - `deepseek_v2.py:1819 rebuild_cp_kv_cache()` → `cp_all_gather_rerange_output(...)`
 - 由 `forward_mla.py:384` 的 absorbed-MLA prepare 调用
 
@@ -287,13 +293,13 @@ decode 路径不受影响，因为 CP 在 decode 之前本来就会清空它的�
 - 我们需要测量的对象是在 CP 部署里运行的 **attention kernel**。
 - 公平、决定性的对比是**按阶段拆分的 kernel 对 kernel**：
 
-| 阶段 | FlashMLA 后端运行 | trtllm_mla 后端运行 |
-|------|-------------------|---------------------|
-| decode  | `flash_mla_with_kvcache`（sgl_kernel，DeepSeek FlashMLA） | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` |
-| prefill（absorbed-MLA 分支） | `flash_mla_with_kvcache` —— **同一个 decode kernel** | `flashinfer.prefill.trtllm_ragged_attention_deepseek` |
-| prefill（纯 ragged 分支） | flashinfer ragged（通过 `super().forward_extend`） | `flashinfer.prefill.trtllm_ragged_attention_deepseek` |
+| 阶段                         | FlashMLA 后端运行                                              | trtllm_mla 后端运行                                         |
+| ---------------------------- | -------------------------------------------------------------- | ----------------------------------------------------------- |
+| decode                       | `flash_mla_with_kvcache`（sgl_kernel，DeepSeek FlashMLA）    | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla` |
+| prefill（absorbed-MLA 分支） | `flash_mla_with_kvcache` —— **同一个 decode kernel** | `flashinfer.prefill.trtllm_ragged_attention_deepseek`     |
+| prefill（纯 ragged 分支）    | flashinfer ragged（通过 `super().forward_extend`）           | `flashinfer.prefill.trtllm_ragged_attention_deepseek`     |
 
-- **更正（重要）。** 早先的草稿说"decode 才是真正的战场；prefill 只是
+- **更正（重要）。** 之前的"decode 才是挑战；prefill 只是
   flashinfer 对 flashinfer 的比较，因为 FlashMLA 没有 prefill kernel"。这是**错的**。
   FlashMLA 在很大一部分 prefill 中也**复用它的 decode kernel**
   （`flash_mla_with_kvcache` → `fwd_kvcache_mla`）。
@@ -305,11 +311,12 @@ decode 路径不受影响，因为 CP 在 decode 之前本来就会清空它的�
   分支运行 `flash_mla_with_kvcache`。只有纯 ragged prefill
   （`forward_mode == EXTEND`、无 prefix、允许 ragged）才回退到 flashinfer。
 - 所以 prefill **不是**只有 flashinfer 的比较，它落在的正是那个 SM90-gated 的
-  FlashMLA decode kernel —— 也就是在 B300 上的头号嫌疑。
+  FlashMLA decode kernel —— 也就是在 B300 上的problem。
 
-### 4. 头号假设（架构 gating）
+### 4. 假设（架构 gating）
 
 来自构建和测试的证据：
+
 - `sgl-kernel/cmake/flashmla.cmake` 只为 **sm90（Hopper）构建 FlashMLA dense
   decode**；它的 sm100 源文件列表是**只有 sparse**。
 - `test_flashmla.py` 用 `is_sm90_supported`（SM90）做 gating。
@@ -325,6 +332,7 @@ decode 路径不受影响，因为 CP 在 decode 之前本来就会清空它的�
 `v_head_dim=128`、page size `64`。
 
 **Decode（absorbed MLA —— kernel 看到的是 latent 维度，不是 192）：**
+
 - q: `(B, 1, H, 576)`，其中 `576 = kv_lora_rank + qk_rope = 512 + 64`
 - kv_cache：FlashMLA 是 `(N_blk, 64, 1, 576)`，trtllm-gen 是 `(N_blk, 1, 64, 576)`
   （注意 head 轴位置 / page 布局不同）
@@ -332,17 +340,18 @@ decode 路径不受影响，因为 CP 在 decode 之前本来就会清空它的�
 - softmax scale 用的是原始的 `192**-0.5`，不是 `576`。
 
 **Prefill（非 absorbed、ragged、causal）：**
+
 - q/k：`(T, H, 192)`，v：`(T, H, 128)`，`cu_seqlens` ragged 布局。
 
 ### 5b. DeepSeek Sparse Attention（DSA / V3.2）的 kernel
 
 DSA 后端（`dsa_backend.py`）按阶段选择三种 kernel 之一：
 
-| 路径 | kernel | 来源 |
-|------|--------|------|
-| sparse prefill | `flash_mla_sparse_fwd`（`:1762`） | sgl_kernel（外部 FlashMLA） |
-| sparse decode  | `flash_mla_with_kvcache(..., indices=..., is_fp8_kvcache=True)`（`:1816`） | sgl_kernel（外部 FlashMLA） |
-| dense fallback | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla`（`:2152`）/ `trtllm_ragged_attention_deepseek`（`:1868`） | flashinfer trtllm-gen |
+| 路径           | kernel                                                                                                                      | 来源                        |
+| -------------- | --------------------------------------------------------------------------------------------------------------------------- | --------------------------- |
+| sparse prefill | `flash_mla_sparse_fwd`（`:1762`）                                                                                       | sgl_kernel（外部 FlashMLA） |
+| sparse decode  | `flash_mla_with_kvcache(..., indices=..., is_fp8_kvcache=True)`（`:1816`）                                              | sgl_kernel（外部 FlashMLA） |
+| dense fallback | `flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla`（`:2152`）/ `trtllm_ragged_attention_deepseek`（`:1868`） | flashinfer trtllm-gen       |
 
 这里有两点很重要：
 
@@ -351,17 +360,20 @@ DSA 后端（`dsa_backend.py`）按阶段选择三种 kernel 之一：
    prefill / decode / sparse 的热点 kernel。
 2. **同样的架构 gating 再次出现**（`dsa_backend.py:1737-1742`）：FlashMLA sparse
    kernel 要求 `num_heads` 是 **Hopper 上 64、Blackwell 上 128** 的倍数：
+
    ```python
    required_padding = 128 if self.device_sm_major >= 10 else 64
    ```
+
    当 TP 把 head 数缩小到倍数以下时，q 会被 zero-pad 到 128 再在之后裁剪 ——
    这是额外的浪费，而且**在 B300 上更严重**。
 
-### 5c. KV cache 到底是怎么存的
+### 5c. KV cache 存储方法
 
 MLA **不**存完整的 K/V；它存一个压缩的 *latent* 加一小段 rope 尾巴。最多有两个 buffer：
 
 **(A) 主 latent KV —— `MLATokenToKVPool`（`memory_pool.py:1631`）：**
+
 ```python
 self.kv_buffer = [
     torch.zeros((size + page_size, 1, kv_cache_dim), dtype=store_dtype, ...)
@@ -369,6 +381,7 @@ self.kv_buffer = [
 ]
 # kv_cache_dim = kv_lora_rank + qk_rope_head_dim = 512 + 64 = 576
 ```
+
 - shape `(num_tokens, 1, 576)`。head 轴是 **1**（MQA：所有 q-head 共享一个 latent
   KV）。这就是 decode kernel 的 `(N_blk, P, 1, 576)` 布局的来源。
 - `get_key_buffer` 返回整个 buffer；`get_value_buffer` 切它的**前 512 维**
@@ -376,17 +389,20 @@ self.kv_buffer = [
   nope 部分，K 是完整的 latent。
 
 **(B) DSA 专属的 indexer cache —— `DSATokenToKVPool`（`memory_pool.py:1994`）：**
+
 ```python
 self.index_k_with_scale_buffer = [...]  # dtype = uint8
 # 每页：buf[:page_size*head_dim]            -> fp8 index_k 数据
 #       buf[page_size*head_dim:].view(f32)  -> 每 token 的 scale
 ```
+
 - `index_head_dim == 128`（固定），page size **64**（固定）。
 - index_k 以 **fp8 量化**存储，scale 打包在同一个 buffer 里。
 - indexer 用 index_k 选出 top-k 的 token，然后把这些 indices 应用到 (A) 的 latent
   KV 上做 sparse attention kernel。
 
 存储流程：
+
 ```
 输入 K, V
   → 压缩成 latent（kv_lora_rank 512 + rope 64 = 576）
@@ -406,18 +422,15 @@ self.index_k_with_scale_buffer = [...]  # dtype = uint8
   kernel 算的是同一个东西时，那一行的计时才可信；可选地导出 Chrome trace 供
   `llm-torch-profiler-analysis` skill 使用。某一行打印 `n/a` 本身就是一个发现
   （说明该后端在这个设备/shape 上没有路径）。
-
 - **`benchmark/mla_cp_kernel_profile/profile_e2e_cp.sh`** —— 端到端验证。用
   `--enable-prefill-context-parallel` 启动一个真实的 DeepSeek 服务器并捕获
   torch-profiler trace，这样我们可以确认隔离的 microbench 是否反映真实的 CP
   部署，并看到每个阶段落到哪个 kernel。
-
 - **`benchmark/mla_cp_kernel_profile/README.md`** —— 使用方法与结果解读指南。
 
 ### 7. 状态 / 下一步
 
-- 脚本仅做了语法检查；它们**必须在 B300 机器上运行**（这台开发机没有
-  GPU/torch）。
+- **必须在 B300 机器上运行**
 - 下一步：跑 decode sweep，看 `speedup = flashmla_ms / trtllm_ms` 随 `seq_k`
   的变化，验证 `cos_diff` 足够小，并记录任何 `n/a`。然后决定修复方向是写一个新的
   Blackwell dense-decode kernel（在外部 `sgl-project/FlashMLA` 仓库里，通过
