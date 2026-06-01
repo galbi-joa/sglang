@@ -492,11 +492,15 @@ def _bench_absorbed_pair(b, s_q, s_k, h, dtype):
     r_fm = time_kernel("flashmla", fm) if fm else TimeResult("flashmla", False, note=fm_note or "unavailable")
     r_tg = time_kernel("trtllm", tg) if tg else TimeResult("trtllm", False, note=tg_note or "unavailable")
 
-    out_fm = fm() if fm else None
-    out_tg = tg() if tg else None
+    # Only fetch outputs for the cross-check if BOTH timed cleanly. A failed run
+    # (e.g. trtllm JIT failure / flashmla 'no kernel image') already recorded its
+    # error in r_*.note; calling it again would just re-raise and abort the sweep.
     cd = float("nan")
-    if out_fm is not None and out_tg is not None:
-        cd = cos_diff(out_fm.reshape(b, h, -1), out_tg.reshape(b, h, -1))
+    if r_fm.ok and r_tg.ok:
+        out_fm = _safe_call(fm)
+        out_tg = _safe_call(tg)
+        if out_fm is not None and out_tg is not None:
+            cd = cos_diff(out_fm.reshape(b, h, -1), out_tg.reshape(b, h, -1))
     sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
     return r_fm, r_tg, sp, cd
 
@@ -592,6 +596,14 @@ def _short_err(e: Exception) -> str:
     """One-line error string for the note column (e.g. the SM100 dense-MLA msg)."""
     s = str(e).strip().splitlines()
     return s[0][:80] if s else type(e).__name__
+
+
+def _safe_call(fn):
+    """Call a runner once for the cross-check, swallowing any kernel error."""
+    try:
+        return fn()
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def maybe_trace(args, fn):
