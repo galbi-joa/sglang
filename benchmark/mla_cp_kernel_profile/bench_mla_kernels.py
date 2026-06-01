@@ -363,6 +363,113 @@ def make_flashinfer_ragged_prefill(q, k, v, cu, seq_lens, b, s_q):
 
 
 # --------------------------------------------------------------------------- #
+# SPARSE decode runners (DeepSeek Sparse Attention / V3.2)
+# --------------------------------------------------------------------------- #
+# This is the ONLY native FlashMLA decode path that exists on B300 (SM100):
+# sgl-kernel/cmake/flashmla.cmake compiles sm100/decode/.../{v32,model1}.cu
+# (sparse, fp8) but no dense decode. FlashMLA runs it via
+# flash_mla_with_kvcache(..., indices=topk, is_fp8_kvcache=True). trtllm-gen
+# handles the same sparse decode as a dense decode over a *reduced* page table
+# (dsa_backend.py:2152). So this is the apples-to-apples sparse comparison.
+DSA_TOPK = 2048  # DeepSeek V3.2 indexer top-k
+
+
+def quantize_k_cache(input_k_cache, dv=KV_LORA_RANK, tile_size=128):
+    """Port of test_flashmla.quantize_k_cache: (num_blocks, block, 1, 576) bf16
+    -> (num_blocks, block, 1, dv + 4*(dv/tile) + 2*(d-dv)) uint8 fp8 layout."""
+    num_blocks, block_size, h_k, d = input_k_cache.shape
+    assert h_k == 1 and dv % tile_size == 0
+    num_tiles = dv // tile_size
+    x = input_k_cache.squeeze(2)  # (num_blocks, block, d)
+    elem = x.element_size()
+    out = torch.empty(
+        (num_blocks, block_size, dv + num_tiles * 4 + elem * (d - dv)),
+        dtype=torch.float8_e4m3fn, device=x.device,
+    )
+    nope = out[..., :dv]
+    scale = out[..., dv:dv + num_tiles * 4].view(torch.float32)
+    rope = out[..., dv + num_tiles * 4:].view(x.dtype)
+    rope[:] = x[..., dv:]
+    for t in range(num_tiles):
+        sl = slice(t * tile_size, (t + 1) * tile_size)
+        inv = x[..., sl].abs().max(dim=-1).values / 448.0  # (num_blocks, block)
+        scale[:, :, t] = inv
+        nope[..., sl] = (x[..., sl].float() / inv.unsqueeze(-1).float()).to(torch.float8_e4m3fn)
+    return out.view(num_blocks, block_size, 1, -1)
+
+
+def build_sparse_inputs(b, s_k, h_q, topk, device="cuda", seed=0):
+    torch.manual_seed(seed)
+    cache_seqlens = torch.full((b,), s_k, dtype=torch.int32, device=device)
+    max_pad = ((s_k + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
+    nblk = max_pad // PAGE_SIZE
+    # bf16 latent, then fp8-quantize the K cache (sparse decode is fp8-only).
+    q = (torch.randn(b, 1, h_q, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    block_table = torch.arange(b * nblk, dtype=torch.int32, device=device).view(b, nblk)
+    kv = (torch.randn(b * nblk, PAGE_SIZE, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    kv_q = quantize_k_cache(kv)  # (nblk, PAGE_SIZE, 1, bytes)
+    q_fp8 = q.to(FP8_DTYPE)
+    # absolute indices into the flattened kv cache (valid range [0, s_k)).
+    idx = torch.randint(0, s_k, (b, 1, topk), dtype=torch.int32, device=device)
+    return q_fp8, kv_q, block_table, cache_seqlens, idx
+
+
+def make_flashmla_sparse_decode(q_fp8, kv_q, cache_seqlens, idx, h_q):
+    flash_mla_with_kvcache, get_mla_metadata = try_import_flashmla()
+    if flash_mla_with_kvcache is None:
+        return None, "flashmla unavailable"
+    topk = idx.shape[-1]
+    try:
+        tile_md, num_splits = get_mla_metadata(
+            cache_seqlens, 1 * h_q // 1, 1, h_q, True, topk
+        )
+    except Exception as e:  # noqa: BLE001
+        return None, _short_err(e)
+
+    def run():
+        out, _ = flash_mla_with_kvcache(
+            q_fp8,
+            kv_q,
+            None,  # block_table unused in sparse path
+            cache_seqlens,
+            HEAD_DIM_V,
+            tile_md,
+            num_splits,
+            softmax_scale=SOFTMAX_SCALE,
+            causal=False,  # sparse path requires causal=False
+            is_fp8_kvcache=True,
+            indices=idx,
+        )
+        return out
+
+    return run, ""
+
+
+def run_sparse_decode(args):
+    """DSA / V3.2 sparse decode -- the only native FlashMLA decode path on B300."""
+    rows = []
+    print(f"\n=== SPARSE DECODE (DSA/V3.2, fp8 KV, topk={DSA_TOPK}, q_len=1) ===")
+    print(f"{'B':>4} {'S_K':>7} {'H':>4} | {'flashmla(ms)':>13} {'trtllm(ms)':>12} "
+          f"{'speedup':>8}")
+    for b in args.batch:
+        for s_k in args.seq_k:
+            for h in args.heads:
+                q_fp8, kv_q, bt, cs, idx = build_sparse_inputs(b, s_k, h, DSA_TOPK)
+                fm, fm_note = make_flashmla_sparse_decode(q_fp8, kv_q, cs, idx, h)
+                r_fm = time_kernel("flashmla_sparse", fm) if fm else TimeResult("flashmla_sparse", False, note=fm_note or "unavailable")
+                # NOTE: trtllm-gen sparse decode reuses trtllm_batch_decode_..._mla
+                # over a reduced page table built from topk_indices
+                # (dsa_backend.py:2130). Wiring that page-table transform here is
+                # nontrivial; for now we time FlashMLA's native sparse kernel and
+                # leave the trtllm column to the e2e profile. See README.
+                print(f"{b:>4} {s_k:>7} {h:>4} | {_fmt(r_fm):>13} {'(e2e)':>12} "
+                      f"{'-':>8}")
+                _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, TimeResult("trtllm", True))
+                rows.append((b, s_k, h, r_fm))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
 # Correctness cross-check (cosine similarity, fp-tolerant)
 # --------------------------------------------------------------------------- #
 def cos_diff(x: torch.Tensor, y: torch.Tensor) -> float:
@@ -506,10 +613,13 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument(
         "--mode",
-        choices=["decode", "prefill_absorbed", "prefill_ragged", "all"],
+        choices=["decode", "prefill_absorbed", "prefill_ragged",
+                 "sparse_decode", "all"],
         default="decode",
         help="decode | prefill_absorbed (FlashMLA decode kernel reused for "
-        "prefill) | prefill_ragged (pure flashinfer fallback) | all",
+        "prefill) | prefill_ragged (pure flashinfer fallback) | sparse_decode "
+        "(DSA/V3.2 fp8 sparse -- the only native FlashMLA decode path on B300) "
+        "| all",
     )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--seq-k", type=int, nargs="+", default=[4096, 16384, 32768],
@@ -544,6 +654,8 @@ def main():
         run_prefill_absorbed(args)
     if args.mode in ("prefill_ragged", "all"):
         run_prefill_ragged(args)
+    if args.mode in ("sparse_decode", "all"):
+        run_sparse_decode(args)
 
     if args.trace:
         # Trace one representative case. For prefill_* modes use s_q (q_len>1);
