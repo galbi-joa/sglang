@@ -49,11 +49,23 @@ SHAPES (DeepSeek-V3 MLA)
   Non-absorbed form (pure ragged prefill only):
     q/k head_dim = 192, v head_dim = 128.
 
+B300 NOTE (important)
+---------------------
+FlashMLA has NO bf16/fp16 dense-decode kernel on Blackwell (SM100/SM103). A bf16
+query raises "BF16 Dense MLA is not supported on SM100" -- this is a *finding*,
+not a bug: it confirms hypothesis #1. The only dense-decode path that exists on
+B300 is FP8 (`fwd_kvcache_mla_fp8`). The script captures the error and prints an
+`n/a` row + the message instead of crashing. For a real head-to-head on B300,
+run with `--dtype fp8`.
+
 USAGE
 -----
-    # decode sweep (long context, q_len=1)
+    # decode sweep -- on B300 use --dtype fp8 (bf16 has no FlashMLA dense kernel)
     python bench_mla_kernels.py --mode decode \
-        --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --dtype bf16
+        --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --dtype fp8
+
+    # the bf16 run is still useful to *document* the missing-kernel finding:
+    python bench_mla_kernels.py --mode decode --seq-k 4096 --heads 128 --dtype bf16
 
     # absorbed-MLA prefill: FlashMLA decode kernel doing prefill work (q_len>1)
     python bench_mla_kernels.py --mode prefill_absorbed \
@@ -88,7 +100,14 @@ HEAD_DIM_QK = QK_NOPE_HEAD_DIM + QK_ROPE_HEAD_DIM  # 192 (prefill q/k)
 SOFTMAX_SCALE = HEAD_DIM_QK ** -0.5  # scaling is on the *original* 192, not 576
 PAGE_SIZE = 64
 
-_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp8": torch.float8_e4m3fn}
+
+# On Blackwell (SM100/B300) FlashMLA has NO bf16/fp16 dense-decode kernel
+# (sgl-kernel/cmake/flashmla.cmake compiles dense decode only for sm90; the
+# sm100 list is sparse-only). The only dense-decode path that exists on B300 is
+# the FP8 one (fwd_kvcache_mla_fp8). So `--dtype fp8` is the realistic regime
+# for comparing FlashMLA vs trtllm-gen decode on B300.
+FP8_DTYPE = torch.float8_e4m3fn
 
 
 # --------------------------------------------------------------------------- #
@@ -170,8 +189,11 @@ def build_decode_inputs(b, s_q, s_k, h_q, dtype, device="cuda", seed=0):
     max_seqlen_pad = ((s_k + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
     num_blocks_per = max_seqlen_pad // PAGE_SIZE
 
+    # Generate in a float type, then cast (randn does not support fp8 directly).
+    gen_dtype = torch.bfloat16 if dtype == FP8_DTYPE else dtype
+
     # absorbed-form query: head_dim = 576
-    q = (torch.randn(b, s_q, h_q, HEAD_DIM_CKV, dtype=dtype, device=device) / 10).clamp_(-1, 1)
+    q = (torch.randn(b, s_q, h_q, HEAD_DIM_CKV, dtype=gen_dtype, device=device) / 10).clamp_(-1, 1)
 
     block_table = torch.arange(
         b * num_blocks_per, dtype=torch.int32, device=device
@@ -180,8 +202,12 @@ def build_decode_inputs(b, s_q, s_k, h_q, dtype, device="cuda", seed=0):
     # latent KV, h_kv = 1, last dim 576. h_kv axis is size-1 so the two backend
     # layouts (.., block, 1, 576) and (.., 1, block, 576) share memory.
     kv_paged = (
-        torch.randn(b * num_blocks_per, PAGE_SIZE, HEAD_DIM_CKV, dtype=dtype, device=device) / 10
+        torch.randn(b * num_blocks_per, PAGE_SIZE, HEAD_DIM_CKV, dtype=gen_dtype, device=device) / 10
     ).clamp_(-1, 1)
+
+    if dtype == FP8_DTYPE:
+        q = q.to(FP8_DTYPE)
+        kv_paged = kv_paged.to(FP8_DTYPE)
     return q, kv_paged, block_table, cache_seqlens, max_seqlen_pad
 
 
@@ -189,14 +215,32 @@ def build_decode_inputs(b, s_q, s_k, h_q, dtype, device="cuda", seed=0):
 # DECODE runners
 # --------------------------------------------------------------------------- #
 def make_flashmla_decode(q, kv_paged, block_table, cache_seqlens, h_q):
+    """Build a FlashMLA decode runner. Returns (run_fn, note).
+
+    run_fn is None when the kernel is unavailable for this dtype/device -- e.g.
+    on B300 a bf16 query raises 'BF16 Dense MLA is not supported on SM100',
+    because FlashMLA only ships an FP8 dense-decode kernel for Blackwell. The
+    error is captured here (not raised) so it surfaces as an `n/a` + note row.
+    """
     flash_mla_with_kvcache, get_mla_metadata = try_import_flashmla()
     if flash_mla_with_kvcache is None:
-        return None
+        return None, "flashmla unavailable"
+
     b, s_q = q.shape[0], q.shape[1]
+    is_fp8 = q.element_size() == 1
     k_cache = kv_paged.unsqueeze(2)  # (num_blocks, PAGE_SIZE, 1, 576)
-    tile_md, num_splits = get_mla_metadata(
-        cache_seqlens, s_q * h_q // 1, 1, h_q, False, None
-    )
+    descale = None
+    if is_fp8:
+        # per-tensor descale = 1.0 (inputs already in the fp8 range); both must
+        # be passed together per the wrapper's assertion.
+        descale = torch.ones((1,), dtype=torch.float32, device=q.device)
+
+    try:
+        tile_md, num_splits = get_mla_metadata(
+            cache_seqlens, s_q * h_q // 1, 1, h_q, is_fp8, None
+        )
+    except Exception as e:  # noqa: BLE001  -- kernel/dtype not built for this SM
+        return None, _short_err(e)
 
     def run():
         out, _ = flash_mla_with_kvcache(
@@ -209,19 +253,23 @@ def make_flashmla_decode(q, kv_paged, block_table, cache_seqlens, h_q):
             num_splits,
             softmax_scale=SOFTMAX_SCALE,
             causal=True,
+            descale_q=descale,
+            descale_k=descale,
+            is_fp8_kvcache=is_fp8,
         )
         return out  # (b, s_q, h_q, 512)
 
-    return run
+    return run, ""
 
 
 def make_trtllm_decode(q, kv_paged, block_table, cache_seqlens, max_seq_len):
+    """Build a trtllm-gen decode runner. Returns (run_fn, note)."""
     fi = try_import_flashinfer()
     if fi is None:
-        return None
+        return None, "flashinfer unavailable"
     kv_cache = kv_paged.unsqueeze(1)  # (num_blocks, 1, PAGE_SIZE, 576)
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
-    bmm1_scale = SOFTMAX_SCALE  # q_scale * k_scale * softmax_scale; bf16 => 1*1*scale
+    bmm1_scale = SOFTMAX_SCALE  # q_scale * k_scale * softmax_scale; descale=1
 
     def run():
         return fi.decode.trtllm_batch_decode_with_kv_cache_mla(
@@ -238,7 +286,7 @@ def make_trtllm_decode(q, kv_paged, block_table, cache_seqlens, max_seq_len):
             # backend defaults to "trtllm-gen"
         )
 
-    return run
+    return run, ""
 
 
 # --------------------------------------------------------------------------- #
@@ -325,35 +373,48 @@ def cos_diff(x: torch.Tensor, y: torch.Tensor) -> float:
 # --------------------------------------------------------------------------- #
 # Drivers
 # --------------------------------------------------------------------------- #
+def _bench_absorbed_pair(b, s_q, s_k, h, dtype):
+    """Build + time the FlashMLA and trtllm-gen absorbed-MLA runners for one
+    shape. Returns (r_fm, r_tg, speedup, cos_diff). Handles the (run, note)
+    tuples and turns a missing kernel into an `n/a` row carrying the note (e.g.
+    'BF16 Dense MLA is not supported on SM100')."""
+    q, kv, bt, cs, _ = build_decode_inputs(b, s_q, s_k, h, dtype)
+    fm, fm_note = make_flashmla_decode(q, kv, bt, cs, h)
+    tg, tg_note = make_trtllm_decode(q, kv, bt, cs, s_k)
+
+    r_fm = time_kernel("flashmla", fm) if fm else TimeResult("flashmla", False, note=fm_note or "unavailable")
+    r_tg = time_kernel("trtllm", tg) if tg else TimeResult("trtllm", False, note=tg_note or "unavailable")
+
+    out_fm = fm() if fm else None
+    out_tg = tg() if tg else None
+    cd = float("nan")
+    if out_fm is not None and out_tg is not None:
+        cd = cos_diff(out_fm.reshape(b, h, -1), out_tg.reshape(b, h, -1))
+    sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
+    return r_fm, r_tg, sp, cd
+
+
+def _print_note_lines(b, shape_str, r_fm, r_tg):
+    """Surface the kernel-unavailable reason underneath an n/a row."""
+    if not r_fm.ok and r_fm.note:
+        print(f"    [{shape_str}] flashmla: {r_fm.note}")
+    if not r_tg.ok and r_tg.note:
+        print(f"    [{shape_str}] trtllm:   {r_tg.note}")
+
+
 def run_decode(args):
     dtype = _DTYPES[args.dtype]
     rows = []
-    print("\n=== DECODE (q_len=1 absorbed MLA, head_dim 576 -> 512) ===")
+    print(f"\n=== DECODE (q_len=1 absorbed MLA, head_dim 576 -> 512, dtype={args.dtype}) ===")
     print(f"{'B':>4} {'S_K':>7} {'H':>4} | {'flashmla(ms)':>13} {'trtllm(ms)':>12} "
           f"{'speedup':>8} {'cos_diff':>10}")
     for b in args.batch:
         for s_k in args.seq_k:
             for h in args.heads:
-                q, kv, bt, cs, max_pad = build_decode_inputs(b, 1, s_k, h, dtype)
-                fm = make_flashmla_decode(q, kv, bt, cs, h)
-                tg = make_trtllm_decode(q, kv, bt, cs, s_k)
-
-                out_fm = out_tg = None
-                r_fm = time_kernel("flashmla", lambda: _capture(fm, "out_fm")) if fm else TimeResult("flashmla", False, note="unavailable")
-                r_tg = time_kernel("trtllm", lambda: _capture(tg, "out_tg")) if tg else TimeResult("trtllm", False, note="unavailable")
-                # one extra call to grab outputs for the cross-check
-                if fm:
-                    out_fm = fm()
-                if tg:
-                    out_tg = tg()
-
-                cd = float("nan")
-                if out_fm is not None and out_tg is not None:
-                    cd = cos_diff(out_fm.reshape(b, h, -1), out_tg.reshape(b, h, -1))
-
-                sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
+                r_fm, r_tg, sp, cd = _bench_absorbed_pair(b, 1, s_k, h, dtype)
                 print(f"{b:>4} {s_k:>7} {h:>4} | {_fmt(r_fm):>13} {_fmt(r_tg):>12} "
                       f"{sp:>8.2f} {cd:>10.2e}")
+                _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, r_tg)
                 rows.append((b, s_k, h, r_fm, r_tg, sp, cd))
     return rows
 
@@ -365,30 +426,18 @@ def run_prefill_absorbed(args):
     wrongly excluded."""
     dtype = _DTYPES[args.dtype]
     rows = []
-    print("\n=== PREFILL (absorbed MLA: FlashMLA decode kernel reused, q_len>1, "
-          "head_dim 576 -> 512, causal) ===")
+    print(f"\n=== PREFILL (absorbed MLA: FlashMLA decode kernel reused, q_len>1, "
+          f"head_dim 576 -> 512, causal, dtype={args.dtype}) ===")
     print(f"{'B':>4} {'S_Q':>7} {'S_K':>7} {'H':>4} | {'flashmla(ms)':>13} "
           f"{'trtllm(ms)':>12} {'speedup':>8} {'cos_diff':>10}")
     for b in args.batch:
         for s_q in args.seq_q:
             for h in args.heads:
                 # s_k == s_q: pure prefill (no cached prefix), causal self-attn.
-                q, kv, bt, cs, max_pad = build_decode_inputs(b, s_q, s_q, h, dtype)
-                fm = make_flashmla_decode(q, kv, bt, cs, h)
-                tg = make_trtllm_decode(q, kv, bt, cs, s_q)
-
-                r_fm = time_kernel("flashmla", lambda: _capture(fm, "out_fm")) if fm else TimeResult("flashmla", False, note="unavailable")
-                r_tg = time_kernel("trtllm", lambda: _capture(tg, "out_tg")) if tg else TimeResult("trtllm", False, note="unavailable")
-                out_fm = fm() if fm else None
-                out_tg = tg() if tg else None
-
-                cd = float("nan")
-                if out_fm is not None and out_tg is not None:
-                    cd = cos_diff(out_fm.reshape(b, h, -1), out_tg.reshape(b, h, -1))
-
-                sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
+                r_fm, r_tg, sp, cd = _bench_absorbed_pair(b, s_q, s_q, h, dtype)
                 print(f"{b:>4} {s_q:>7} {s_q:>7} {h:>4} | {_fmt(r_fm):>13} "
                       f"{_fmt(r_tg):>12} {sp:>8.2f} {cd:>10.2e}")
+                _print_note_lines(b, f"B={b} S_Q={s_q} H={h}", r_fm, r_tg)
                 rows.append((b, s_q, h, r_fm, r_tg, sp, cd))
     return rows
 
@@ -428,17 +477,14 @@ def run_prefill_ragged(args):
 
 
 # small helpers
-_CAP = {}
-
-
-def _capture(fn, key):
-    out = fn()
-    _CAP[key] = out
-    return out
-
-
 def _fmt(r: TimeResult) -> str:
     return f"{r.ms:.3f}" if r.ok else "n/a"
+
+
+def _short_err(e: Exception) -> str:
+    """One-line error string for the note column (e.g. the SM100 dense-MLA msg)."""
+    s = str(e).strip().splitlines()
+    return s[0][:80] if s else type(e).__name__
 
 
 def maybe_trace(args, fn):
@@ -482,9 +528,15 @@ def main():
     maj, minr = device_cap()
     print(f"device: {torch.cuda.get_device_name()}  SM {maj}.{minr}  "
           f"torch {torch.__version__}")
-    print(f"note: flashmla decode is gated to SM90 (Hopper) in sgl-kernel; "
-          f"trtllm-gen MLA targets SM100/120 (Blackwell). On B300 (SM10x) "
-          f"watch whether flashmla even has a native dense-decode path.")
+    if maj >= 10 and args.dtype in ("bf16", "fp16"):
+        print(f"WARNING: on SM{maj}.{minr} (Blackwell) FlashMLA has NO "
+              f"{args.dtype} dense-decode kernel -- flashmla rows will show n/a "
+              f"with 'Dense MLA is not supported on SM100'. Re-run with "
+              f"--dtype fp8 for the path that actually exists on B300.")
+    else:
+        print(f"note: FlashMLA dense decode is built for SM90 (bf16/fp16) and "
+              f"SM90+ FP8; on Blackwell only the FP8 dense path exists. "
+              f"trtllm-gen MLA targets SM100/120.")
 
     if args.mode in ("decode", "all"):
         run_decode(args)
@@ -494,15 +546,21 @@ def main():
         run_prefill_ragged(args)
 
     if args.trace:
-        # trace the long-context decode case (the mentor's regime)
+        # Trace one representative case. For prefill_* modes use s_q (q_len>1);
+        # otherwise the long-context decode case.
         dtype = _DTYPES[args.dtype]
-        q, kv, bt, cs, max_pad = build_decode_inputs(
-            args.batch[0], 1, args.seq_k[-1], args.heads[0], dtype
-        )
-        tg = make_trtllm_decode(q, kv, bt, cs, args.seq_k[-1])
-        fm = make_flashmla_decode(q, kv, bt, cs, args.heads[0])
+        if args.mode.startswith("prefill"):
+            s_q = s_k = args.seq_q[-1]
+        else:
+            s_q, s_k = 1, args.seq_k[-1]
+        q, kv, bt, cs, _ = build_decode_inputs(args.batch[0], s_q, s_k, args.heads[0], dtype)
+        fm, fm_note = make_flashmla_decode(q, kv, bt, cs, args.heads[0])
+        tg, tg_note = make_trtllm_decode(q, kv, bt, cs, s_k)
         target = fm or tg
-        if target:
+        if target is None:
+            print(f"[trace] no runnable kernel for this shape/dtype "
+                  f"(flashmla: {fm_note or 'n/a'}; trtllm: {tg_note or 'n/a'})")
+        else:
             for _ in range(5):
                 target()
             torch.cuda.synchronize()
