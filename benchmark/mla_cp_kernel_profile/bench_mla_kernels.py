@@ -403,18 +403,18 @@ def build_sparse_inputs(b, s_k, h_q, topk, device="cuda", seed=0):
     cache_seqlens = torch.full((b,), s_k, dtype=torch.int32, device=device)
     max_pad = ((s_k + PAGE_SIZE - 1) // PAGE_SIZE) * PAGE_SIZE
     nblk = max_pad // PAGE_SIZE
-    # bf16 latent, then fp8-quantize the K cache (sparse decode is fp8-only).
+    # DSA sparse decode keeps q in bf16; only the K cache is fp8-quantized.
+    # (dsa_backend.py: q_all stays bf16 at :1792, quantize_k_cache only on KV.)
     q = (torch.randn(b, 1, h_q, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
     block_table = torch.arange(b * nblk, dtype=torch.int32, device=device).view(b, nblk)
     kv = (torch.randn(b * nblk, PAGE_SIZE, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
-    kv_q = quantize_k_cache(kv)  # (nblk, PAGE_SIZE, 1, bytes)
-    q_fp8 = q.to(FP8_DTYPE)
+    kv_q = quantize_k_cache(kv)  # (nblk, PAGE_SIZE, 1, bytes), fp8
     # absolute indices into the flattened kv cache (valid range [0, s_k)).
     idx = torch.randint(0, s_k, (b, 1, topk), dtype=torch.int32, device=device)
-    return q_fp8, kv_q, block_table, cache_seqlens, idx
+    return q, kv_q, block_table, cache_seqlens, idx
 
 
-def make_flashmla_sparse_decode(q_fp8, kv_q, cache_seqlens, idx, h_q):
+def make_flashmla_sparse_decode(q, kv_q, cache_seqlens, idx, h_q):
     flash_mla_with_kvcache, get_mla_metadata = try_import_flashmla()
     if flash_mla_with_kvcache is None:
         return None, "flashmla unavailable"
@@ -428,7 +428,7 @@ def make_flashmla_sparse_decode(q_fp8, kv_q, cache_seqlens, idx, h_q):
     pad_to = 128 if maj >= 10 else 64
     h_pad = ((h_q + pad_to - 1) // pad_to) * pad_to
     if h_pad != h_q:
-        q_fp8 = torch.nn.functional.pad(q_fp8, (0, 0, 0, h_pad - h_q))
+        q = torch.nn.functional.pad(q, (0, 0, 0, h_pad - h_q))
 
     try:
         tile_md, num_splits = get_mla_metadata(
@@ -442,10 +442,10 @@ def make_flashmla_sparse_decode(q_fp8, kv_q, cache_seqlens, idx, h_q):
         # wrapper asserts `block_table is not None`. dsa_backend.py:1826 passes a
         # (batch, 0) empty int32 tensor for exactly this reason; mirror it.
         empty_block_table = torch.empty(
-            (q_fp8.shape[0], 0), dtype=torch.int32, device=q_fp8.device
+            (q.shape[0], 0), dtype=torch.int32, device=q.device
         )
         out, _ = flash_mla_with_kvcache(
-            q=q_fp8,
+            q=q,
             k_cache=kv_q,
             block_table=empty_block_table,
             cache_seqlens=cache_seqlens,
@@ -471,8 +471,8 @@ def run_sparse_decode(args):
     for b in args.batch:
         for s_k in args.seq_k:
             for h in args.heads:
-                q_fp8, kv_q, bt, cs, idx = build_sparse_inputs(b, s_k, h, DSA_TOPK)
-                fm, fm_note = make_flashmla_sparse_decode(q_fp8, kv_q, cs, idx, h)
+                q, kv_q, bt, cs, idx = build_sparse_inputs(b, s_k, h, DSA_TOPK)
+                fm, fm_note = make_flashmla_sparse_decode(q, kv_q, cs, idx, h)
                 r_fm = time_kernel("flashmla_sparse", fm) if fm else TimeResult("flashmla_sparse", False, note=fm_note or "unavailable")
                 # NOTE: trtllm-gen sparse decode reuses trtllm_batch_decode_..._mla
                 # over a reduced page table built from topk_indices
