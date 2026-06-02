@@ -462,8 +462,44 @@ def make_flashmla_sparse_decode(q, kv_q, cache_seqlens, idx, h_q):
     return run, ""
 
 
+def make_trtllm_sparse_decode(kv_q_dim_kv, cache_seqlens, idx, b, s_k, h_q, kv_bf16):
+    """trtllm-gen sparse decode. dsa_backend.py:2152 calls
+    trtllm_batch_decode_with_kv_cache_mla with sparse_mla_top_k=topk and a
+    block_tables that already encodes the topk positions. We feed the topk
+    indices directly as the (page_size=1) block table."""
+    fi = try_import_flashinfer()
+    if fi is None:
+        return None, "flashinfer unavailable"
+    topk = idx.shape[-1]
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
+    # trtllm-gen MLA keeps q in bf16 and a bf16/fp8 paged kv cache laid out as
+    # (num_blocks, 1, page_size, kv_cache_dim). Use the same bf16 latent KV.
+    q = torch.randn(b, 1, h_q, HEAD_DIM_CKV, dtype=torch.bfloat16, device="cuda")
+    # block_tables for sparse: (batch, 1, topk) of kv positions, page_size 1.
+    block_tables = idx.view(b, 1, topk).to(torch.int32)
+
+    def run():
+        return fi.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q,
+            kv_cache=kv_bf16,
+            workspace_buffer=workspace,
+            qk_nope_head_dim=QK_NOPE_HEAD_DIM,
+            kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM,
+            block_tables=block_tables,
+            seq_lens=cache_seqlens,
+            max_seq_len=int(s_k),
+            sparse_mla_top_k=topk,
+            bmm1_scale=SOFTMAX_SCALE,
+            backend="trtllm-gen",
+        )
+
+    return run, ""
+
+
 def run_sparse_decode(args):
-    """DSA / V3.2 sparse decode -- the only native FlashMLA decode path on B300."""
+    """DSA / V3.2 sparse decode: FlashMLA native sparse kernel (the path B300
+    can run after the CUDA-13 rebuild) vs trtllm-gen sparse decode."""
     rows = []
     print(f"\n=== SPARSE DECODE (DSA/V3.2, fp8 KV, topk={DSA_TOPK}, q_len=1) ===")
     print(f"{'B':>4} {'S_K':>7} {'H':>4} | {'flashmla(ms)':>13} {'trtllm(ms)':>12} "
@@ -471,18 +507,29 @@ def run_sparse_decode(args):
     for b in args.batch:
         for s_k in args.seq_k:
             for h in args.heads:
+                if DSA_TOPK > s_k:
+                    print(f"{b:>4} {s_k:>7} {h:>4} | {'skip':>13} {'skip':>12} "
+                          f"{'-':>8}   (S_K < topk={DSA_TOPK})")
+                    continue
                 q, kv_q, bt, cs, idx = build_sparse_inputs(b, s_k, h, DSA_TOPK)
+                # bf16 paged latent KV for the trtllm path (it does not take the
+                # fp8-packed layout FlashMLA uses).
+                nblk = kv_q.shape[0]
+                kv_bf16 = (torch.randn(nblk, 1, PAGE_SIZE, HEAD_DIM_CKV,
+                                       dtype=torch.bfloat16, device="cuda") / 10).clamp_(-1, 1)
+
                 fm, fm_note = make_flashmla_sparse_decode(q, kv_q, cs, idx, h)
+                tg, tg_note = make_trtllm_sparse_decode(
+                    kv_q.shape, cs, idx, b, s_k, h, kv_bf16
+                )
                 r_fm = time_kernel("flashmla_sparse", fm) if fm else TimeResult("flashmla_sparse", False, note=fm_note or "unavailable")
-                # NOTE: trtllm-gen sparse decode reuses trtllm_batch_decode_..._mla
-                # over a reduced page table built from topk_indices
-                # (dsa_backend.py:2130). Wiring that page-table transform here is
-                # nontrivial; for now we time FlashMLA's native sparse kernel and
-                # leave the trtllm column to the e2e profile. See README.
-                print(f"{b:>4} {s_k:>7} {h:>4} | {_fmt(r_fm):>13} {'(e2e)':>12} "
-                      f"{'-':>8}")
-                _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, TimeResult("trtllm", True))
-                rows.append((b, s_k, h, r_fm))
+                r_tg = time_kernel("trtllm_sparse", tg) if tg else TimeResult("trtllm_sparse", False, note=tg_note or "unavailable")
+
+                sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
+                print(f"{b:>4} {s_k:>7} {h:>4} | {_fmt(r_fm):>13} {_fmt(r_tg):>12} "
+                      f"{sp:>8.2f}")
+                _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, r_tg)
+                rows.append((b, s_k, h, r_fm, r_tg, sp))
     return rows
 
 
