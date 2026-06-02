@@ -438,18 +438,24 @@ def make_flashmla_sparse_decode(q_fp8, kv_q, cache_seqlens, idx, h_q):
         return None, _short_err(e)
 
     def run():
+        # block_table is unused by the sparse path but must NOT be None -- the
+        # wrapper asserts `block_table is not None`. dsa_backend.py:1826 passes a
+        # (batch, 0) empty int32 tensor for exactly this reason; mirror it.
+        empty_block_table = torch.empty(
+            (q_fp8.shape[0], 0), dtype=torch.int32, device=q_fp8.device
+        )
         out, _ = flash_mla_with_kvcache(
-            q_fp8,
-            kv_q,
-            None,  # block_table unused in sparse path
-            cache_seqlens,
-            HEAD_DIM_V,
-            tile_md,
-            num_splits,
+            q=q_fp8,
+            k_cache=kv_q,
+            block_table=empty_block_table,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=HEAD_DIM_V,
+            tile_scheduler_metadata=tile_md,
+            num_splits=num_splits,
             softmax_scale=SOFTMAX_SCALE,
-            causal=False,  # sparse path requires causal=False
             is_fp8_kvcache=True,
             indices=idx,
+            # causal omitted -> defaults to False (sparse path requires False)
         )
         return out
 
