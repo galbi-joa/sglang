@@ -497,6 +497,92 @@ def make_trtllm_sparse_decode(kv_q_dim_kv, cache_seqlens, idx, b, s_k, h_q, kv_b
     return run, ""
 
 
+def make_flashmla_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
+    """FlashMLA sparse PREFILL (q_len>1) via flash_mla_sparse_fwd. This is the
+    'use the FlashMLA kernel for prefill' path the mentor pointed at: a multi-
+    token query attending to topk-selected KV. q/kv are bf16; indices are
+    [s_q, h_kv=1, topk] int32 into the s_kv KV rows. (sgl_kernel flash_mla.py:310)
+    """
+    try:
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+    except Exception as e:  # noqa: BLE001
+        return None, f"flashmla unavailable: {e}"
+
+    torch.manual_seed(seed)
+    # sparse prefill kernel expects num_heads multiple of 64/128 (see cmake
+    # head64/head128 instantiations); pad like dsa_backend does on Blackwell.
+    pad_to = 128 if device_cap()[0] >= 10 else 64
+    h_pad = ((h_q + pad_to - 1) // pad_to) * pad_to
+
+    q = (torch.randn(s_q, h_pad, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    kv = (torch.randn(s_kv, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    eff_topk = min(topk, s_kv)
+    idx = torch.randint(0, s_kv, (s_q, 1, eff_topk), dtype=torch.int32, device=device)
+
+    def run():
+        out, _, _ = flash_mla_sparse_fwd(
+            q=q, kv=kv, indices=idx, sm_scale=SOFTMAX_SCALE, d_v=HEAD_DIM_V
+        )
+        return out
+
+    return run, ""
+
+
+def make_trtllm_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
+    """trtllm-gen ragged prefill with sparse topk, for comparison."""
+    fi = try_import_flashinfer()
+    if fi is None:
+        return None, "flashinfer unavailable"
+    # trtllm path: use the ragged DeepSeek prefill kernel. (Sparse selection in
+    # trtllm-gen prefill goes through a reduced KV gather upstream; here we time
+    # the dense ragged kernel over the topk-sized KV as the closest standalone
+    # analogue, matching kv length = topk.)
+    torch.manual_seed(seed)
+    kv_len = min(topk, s_kv)
+    q = torch.randn(s_q, h_q, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+    k = torch.randn(s_q, h_q, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+    v = torch.randn(s_q, h_q, QK_NOPE_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    cu = torch.tensor([0, s_q], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([s_q], dtype=torch.int32, device=device)
+    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+
+    def run():
+        return fi.prefill.trtllm_ragged_attention_deepseek(
+            query=q, key=k, value=v, workspace_buffer=workspace,
+            seq_lens=seq_lens, max_q_len=s_q, max_kv_len=s_q,
+            bmm1_scale=SOFTMAX_SCALE, bmm2_scale=1.0, o_sf_scale=-1.0,
+            batch_size=1, window_left=-1,
+            cum_seq_lens_q=cu, cum_seq_lens_kv=cu,
+            enable_pdl=False, is_causal=True, return_lse=False,
+        )
+
+    return run, ""
+
+
+def run_sparse_prefill(args):
+    """FlashMLA sparse prefill (q_len>1) -- the 'FlashMLA kernel doing prefill'
+    path -- vs trtllm-gen prefill."""
+    rows = []
+    print(f"\n=== SPARSE PREFILL (FlashMLA flash_mla_sparse_fwd, q_len>1, "
+          f"topk={DSA_TOPK}) ===")
+    print(f"{'B':>4} {'S_Q':>7} {'S_KV':>7} {'H':>4} | {'flashmla(ms)':>13} "
+          f"{'trtllm(ms)':>12} {'speedup':>8}")
+    for b in args.batch:
+        for s_q in args.seq_q:
+            for h in args.heads:
+                s_kv = s_q  # pure prefill: KV length == query length
+                fm, fm_note = make_flashmla_sparse_prefill(s_q, s_kv, h, DSA_TOPK)
+                tg, tg_note = make_trtllm_sparse_prefill(s_q, s_kv, h, DSA_TOPK)
+                r_fm = time_kernel("flashmla_sparse_prefill", fm) if fm else TimeResult("flashmla", False, note=fm_note or "unavailable")
+                r_tg = time_kernel("trtllm_prefill", tg) if tg else TimeResult("trtllm", False, note=tg_note or "unavailable")
+                sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
+                print(f"{b:>4} {s_q:>7} {s_kv:>7} {h:>4} | {_fmt(r_fm):>13} "
+                      f"{_fmt(r_tg):>12} {sp:>8.2f}")
+                _print_note_lines(b, f"B={b} S_Q={s_q} H={h}", r_fm, r_tg)
+                rows.append((b, s_q, h, r_fm, r_tg, sp))
+    return rows
+
+
 def run_sparse_decode(args):
     """DSA / V3.2 sparse decode: FlashMLA native sparse kernel (the path B300
     can run after the CUDA-13 rebuild) vs trtllm-gen sparse decode."""
@@ -690,12 +776,13 @@ def main():
     p.add_argument(
         "--mode",
         choices=["decode", "prefill_absorbed", "prefill_ragged",
-                 "sparse_decode", "all"],
+                 "sparse_decode", "sparse_prefill", "all"],
         default="decode",
         help="decode | prefill_absorbed (FlashMLA decode kernel reused for "
         "prefill) | prefill_ragged (pure flashinfer fallback) | sparse_decode "
-        "(DSA/V3.2 fp8 sparse -- the only native FlashMLA decode path on B300) "
-        "| all",
+        "(DSA/V3.2 fp8 sparse decode -- runs on B300) | sparse_prefill "
+        "(FlashMLA sparse kernel doing prefill, q_len>1 -- the 'kernel for "
+        "prefill' path) | all",
     )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--seq-k", type=int, nargs="+", default=[4096, 16384, 32768],
@@ -732,6 +819,8 @@ def main():
         run_prefill_ragged(args)
     if args.mode in ("sparse_decode", "all"):
         run_sparse_decode(args)
+    if args.mode in ("sparse_prefill", "all"):
+        run_sparse_prefill(args)
 
     if args.trace:
         # Trace one representative case. For prefill_* modes use s_q (q_len>1);
