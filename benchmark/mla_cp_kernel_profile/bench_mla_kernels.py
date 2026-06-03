@@ -498,9 +498,12 @@ def make_trtllm_sparse_decode(kv_q_dim_kv, cache_seqlens, idx, b, s_k, h_q, kv_b
 
 
 def make_flashmla_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
-    """FlashMLA sparse PREFILL (q_len>1) via flash_mla_sparse_fwd. This is the
-    'use the FlashMLA kernel for prefill' path the mentor pointed at: a multi-
-    token query attending to topk-selected KV. q/kv are bf16; indices are
+    """FlashMLA sparse PREFILL (extend) via flash_mla_sparse_fwd. This is the
+    'use the FlashMLA kernel for prefill' path the mentor pointed at.
+
+    Extend semantics: s_q new query tokens attend to s_kv total KV rows
+    (s_kv = cached_prefix + new). For a CP run, pass the per-rank q length
+    (s_q already divided by cp_size by the caller). q/kv are bf16; indices are
     [s_q, h_kv=1, topk] int32 into the s_kv KV rows. (sgl_kernel flash_mla.py:310)
     """
     try:
@@ -529,30 +532,31 @@ def make_flashmla_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
 
 
 def make_trtllm_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
-    """trtllm-gen ragged prefill with sparse topk, for comparison."""
+    """trtllm-gen ragged prefill (extend) for comparison.
+
+    Extend: s_q new query tokens, s_kv total KV (cached prefix + new). q/k/v are
+    the non-absorbed form; cu_seqlens distinguishes the q span (new tokens) from
+    the kv span (cached + new), which is what makes this an extend, not a pure
+    prefill."""
     fi = try_import_flashinfer()
     if fi is None:
         return None, "flashinfer unavailable"
-    # trtllm path: use the ragged DeepSeek prefill kernel. (Sparse selection in
-    # trtllm-gen prefill goes through a reduced KV gather upstream; here we time
-    # the dense ragged kernel over the topk-sized KV as the closest standalone
-    # analogue, matching kv length = topk.)
     torch.manual_seed(seed)
-    kv_len = min(topk, s_kv)
     q = torch.randn(s_q, h_q, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    k = torch.randn(s_q, h_q, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
-    v = torch.randn(s_q, h_q, QK_NOPE_HEAD_DIM, dtype=torch.bfloat16, device=device)
-    cu = torch.tensor([0, s_q], dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([s_q], dtype=torch.int32, device=device)
-    workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device=device)
+    k = torch.randn(s_kv, h_q, HEAD_DIM_QK, dtype=torch.bfloat16, device=device)
+    v = torch.randn(s_kv, h_q, QK_NOPE_HEAD_DIM, dtype=torch.bfloat16, device=device)
+    cu_q = torch.tensor([0, s_q], dtype=torch.int32, device=device)
+    cu_kv = torch.tensor([0, s_kv], dtype=torch.int32, device=device)
+    seq_lens = torch.tensor([s_kv], dtype=torch.int32, device=device)
+    workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
     def run():
         return fi.prefill.trtllm_ragged_attention_deepseek(
             query=q, key=k, value=v, workspace_buffer=workspace,
-            seq_lens=seq_lens, max_q_len=s_q, max_kv_len=s_q,
+            seq_lens=seq_lens, max_q_len=s_q, max_kv_len=s_kv,
             bmm1_scale=SOFTMAX_SCALE, bmm2_scale=1.0, o_sf_scale=-1.0,
             batch_size=1, window_left=-1,
-            cum_seq_lens_q=cu, cum_seq_lens_kv=cu,
+            cum_seq_lens_q=cu_q, cum_seq_lens_kv=cu_kv,
             enable_pdl=False, is_causal=True, return_lse=False,
         )
 
@@ -560,27 +564,36 @@ def make_trtllm_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
 
 
 def run_sparse_prefill(args):
-    """FlashMLA sparse prefill (q_len>1) -- the 'FlashMLA kernel doing prefill'
-    path -- vs trtllm-gen prefill."""
+    """FlashMLA sparse prefill / EXTEND -- the 'FlashMLA kernel doing prefill'
+    path the mentor pointed at, at realistic long-context sizes.
+
+    Extend: cached prefix (--cached-len) + new tokens (--seq-q) so that
+    kv_len = cached + new. Under CP the new tokens are sharded across cp_size
+    ranks, so each rank's q is new/cp_size while it still attends to the full
+    (all-gathered) KV -- we measure that per-rank kernel call."""
     rows = []
-    print(f"\n=== SPARSE PREFILL (FlashMLA flash_mla_sparse_fwd, q_len>1, "
-          f"topk={DSA_TOPK}) ===")
-    print(f"{'B':>4} {'S_Q':>7} {'S_KV':>7} {'H':>4} | {'flashmla(ms)':>13} "
-          f"{'trtllm(ms)':>12} {'speedup':>8}")
+    cp = max(1, args.cp_size)
+    cached = args.cached_len
+    print(f"\n=== SPARSE PREFILL / EXTEND (FlashMLA flash_mla_sparse_fwd, "
+          f"cached={cached}, topk={DSA_TOPK}, cp_size={cp}) ===")
+    print(f"{'B':>4} {'NEW':>8} {'CACHED':>8} {'KV_TOT':>8} {'q/rank':>8} {'H':>4} | "
+          f"{'flashmla(ms)':>13} {'trtllm(ms)':>12} {'speedup':>8}")
     for b in args.batch:
-        for s_q in args.seq_q:
+        for new in args.seq_q:
             for h in args.heads:
-                s_kv = s_q  # pure prefill: KV length == query length
-                fm, fm_note = make_flashmla_sparse_prefill(s_q, s_kv, h, DSA_TOPK)
-                tg, tg_note = make_trtllm_sparse_prefill(s_q, s_kv, h, DSA_TOPK)
+                kv_tot = cached + new                 # total KV the query attends to
+                q_per_rank = max(1, new // cp)        # CP shards the new tokens
+                fm, fm_note = make_flashmla_sparse_prefill(q_per_rank, kv_tot, h, DSA_TOPK)
+                tg, tg_note = make_trtllm_sparse_prefill(q_per_rank, kv_tot, h, DSA_TOPK)
                 r_fm = time_kernel("flashmla_sparse_prefill", fm) if fm else TimeResult("flashmla", False, note=fm_note or "unavailable")
                 r_tg = time_kernel("trtllm_prefill", tg) if tg else TimeResult("trtllm", False, note=tg_note or "unavailable")
                 sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
-                print(f"{b:>4} {s_q:>7} {s_kv:>7} {h:>4} | {_fmt(r_fm):>13} "
-                      f"{_fmt(r_tg):>12} {sp:>8.2f}")
-                _print_note_lines(b, f"B={b} S_Q={s_q} H={h}", r_fm, r_tg)
-                rows.append((b, s_q, h, r_fm, r_tg, sp))
-                _record("sparse_prefill", b, s_q, s_kv, h, "bf16", r_fm, r_tg,
+                print(f"{b:>4} {new:>8} {cached:>8} {kv_tot:>8} {q_per_rank:>8} {h:>4} | "
+                      f"{_fmt(r_fm):>13} {_fmt(r_tg):>12} {sp:>8.2f}")
+                _print_note_lines(b, f"new={new} cached={cached} cp={cp} H={h}", r_fm, r_tg)
+                rows.append((b, new, cached, h, r_fm, r_tg, sp))
+                _record("sparse_prefill_extend", b, q_per_rank, kv_tot, h,
+                        f"cp{cp}_cached{cached}", r_fm, r_tg,
                         "flashmla_sparse_prefill", "trtllm_ragged_prefill")
     return rows
 
@@ -841,7 +854,15 @@ def main():
     p.add_argument("--seq-k", type=int, nargs="+", default=[4096, 16384, 32768],
                    help="decode KV length (long-context regime)")
     p.add_argument("--seq-q", type=int, nargs="+", default=[2048, 8192],
-                   help="prefill query length")
+                   help="prefill/extend NEW query length (e.g. 10000 for a "
+                   "90k-cached + 10k-new extend)")
+    p.add_argument("--cached-len", type=int, default=0,
+                   help="sparse_prefill EXTEND: cached prefix length already in "
+                   "KV; total KV = cached-len + seq-q (e.g. --cached-len 90000)")
+    p.add_argument("--cp-size", type=int, default=1,
+                   help="context-parallel size: NEW tokens are sharded across "
+                   "cp_size ranks, so the measured per-rank q = seq-q // cp_size "
+                   "while KV stays the full (all-gathered) length")
     p.add_argument("--heads", type=int, nargs="+", default=[128],
                    help="q heads after TP (128 for TP=1, 16 for TP=8, ...)")
     p.add_argument("--dtype", choices=list(_DTYPES), default="bf16")

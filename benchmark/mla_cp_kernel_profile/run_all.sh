@@ -50,9 +50,14 @@ run "prefill_ragged_bf16" --mode prefill_ragged --batch 1 --seq-q $SEQ_Q --heads
 #    after the CUDA-13 rebuild. FlashMLA sparse vs trtllm-gen sparse.
 run "sparse_decode" --mode sparse_decode --batch $BATCH --seq-k $SEQ_K --heads $HEADS
 
-# 6) sparse prefill (q_len>1) -- the "FlashMLA kernel doing prefill" path the
-#    mentor pointed at. flash_mla_sparse_fwd vs trtllm-gen ragged prefill.
-run "sparse_prefill" --mode sparse_prefill --batch 1 --seq-q $SEQ_Q --heads $HEADS
+# 6) sparse prefill / EXTEND -- the "FlashMLA kernel doing prefill" path at a
+#    realistic long-context size: CACHED prefix + NEW tokens, optionally CP.
+#    Defaults to the mentor's 90k-cached + 10k-new extend; override via env.
+CACHED_LEN="${CACHED_LEN:-90000}"
+NEW_LEN="${NEW_LEN:-10000}"
+CP_SIZE="${CP_SIZE:-1}"
+run "sparse_prefill_extend" --mode sparse_prefill \
+    --batch 1 --seq-q $NEW_LEN --cached-len $CACHED_LEN --cp-size $CP_SIZE --heads $HEADS
 
 echo ""
 echo "=== Done. Per-regime logs under $OUT/${STAMP}_*.log ==="

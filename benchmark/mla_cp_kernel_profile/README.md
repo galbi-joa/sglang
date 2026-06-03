@@ -71,18 +71,44 @@ python bench_mla_kernels.py --mode decode --seq-k 32768 --batch 1 \
     --trace trace_decode_32k.json
 #    -> feed trace_decode_32k.json to the `llm-torch-profiler-analysis` skill
 
-# 5) Run everything at once, and save a CSV
+# 5) sparse prefill / EXTEND at long context: 90k cached + 10k new (the
+#    realistic regime). --cached-len is the prefix already in KV; --seq-q is the
+#    new tokens; total KV = cached + new.
+python bench_mla_kernels.py --mode sparse_prefill \
+    --batch 1 --seq-q 10000 --cached-len 90000 --heads 128 --csv extend.csv
+
+#    ...and under context parallel (CP): new tokens are sharded across cp_size
+#    ranks, so the measured per-rank q = 10000 / 8 while KV stays the full 100k.
+python bench_mla_kernels.py --mode sparse_prefill \
+    --batch 1 --seq-q 10000 --cached-len 90000 --cp-size 8 --heads 128 --csv extend_cp8.csv
+
+# 6) Run everything at once, and save a CSV
 python bench_mla_kernels.py --mode all \
     --batch 1 --seq-k 4096 16384 32768 --seq-q 2048 8192 --heads 128 \
     --csv results.csv
 
-# 6) Full sweep helper: writes per-regime logs + CSVs and a combined CSV
-bash run_all.sh                 # results/<stamp>_*.log, *.csv, *_combined.csv
+# 7) Full sweep helper: writes per-regime logs + CSVs and a combined CSV.
+#    The sparse_prefill regime defaults to 90k cached + 10k new; override:
+CACHED_LEN=90000 NEW_LEN=10000 CP_SIZE=8 bash run_all.sh
 
-# 7) End-to-end with CP actually enabled, per backend
+# 8) End-to-end with CP actually enabled, per backend
 BACKEND=flashmla    bash profile_e2e_cp.sh
 BACKEND=trtllm_mla  bash profile_e2e_cp.sh
 ```
+
+## Long-context EXTEND + Context Parallel (the realistic regime)
+
+`--mode sparse_prefill` models an **extend** step: a query of `--seq-q` *new*
+tokens attends to `--cached-len + --seq-q` total KV (the cached prefix plus the
+new tokens). This is the "90k cached + 10k new" scenario, not a toy pure-prefill.
+
+`--cp-size N` reflects **context parallel**: the N ranks split the *new* tokens,
+so each rank's kernel call processes `seq-q // N` query rows while still
+attending to the full all-gathered KV. The benchmark times that per-rank call —
+i.e. the attention work one CP rank actually does. (CP's cross-rank KV
+all-gather is a separate collective at the model level, not part of the kernel;
+see benchmarkno1.md section (d).) Sweep `--cp-size 1 2 4 8` to see how per-rank
+attention cost scales as you add CP ranks.
 
 ### CSV output (`--csv`)
 
