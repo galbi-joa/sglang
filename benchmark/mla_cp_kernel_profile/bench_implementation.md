@@ -45,7 +45,7 @@ FlashMLA（sgl_kernel）与 trtllm-gen（flashinfer 提供的 kernel）。
 | `prefill_absorbed` | 用 decode kernel 做 prefill（q_len>1） | `flash_mla_with_kvcache`（dense） | 同上 decode kernel |
 | `prefill_ragged` | 纯 ragged prefill 回退路径 | flashinfer ragged wrapper | `trtllm_ragged_attention_deepseek` |
 | `sparse_decode` | DSA/V3.2 稀疏 decode（fp8 KV） | `flash_mla_with_kvcache(indices=...)` | `trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k=...)` |
-| `sparse_prefill` | DSA 稀疏 prefill / EXTEND（q_len>1） | `flash_mla_sparse_fwd` | `trtllm_ragged_attention_deepseek`（dense） |
+| `sparse_prefill` | DSA 稀疏 prefill / EXTEND（q_len>1） | `flash_mla_sparse_fwd` | `trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k=...)`（absorbed sparse） |
 
 模式设计的背景：
 
@@ -103,71 +103,75 @@ DSA topk  = 2048
   - indices: `(B, 1, topk)` int32，指向被选中的 KV 行
   - head 数会按 64/128 的倍数 padding（与 dsa_backend 在 Blackwell 上的处理一致）
 
-- **sparse_prefill / EXTEND**
-  - FlashMLA：q `(s_q, H, 576)` bf16，kv `(s_kv, 1, 576)` bf16，indices `(s_q, 1, topk)`
-    （s_q = new // cp_size，s_kv = cached + new）
-  - trtllm：q `(s_q, H, 192)`，k `(s_kv, H, 192)`，v `(s_kv, H, 128)`，
-    q 与 kv 用各自的 cu_seqlens（q 跨度为 new，kv 跨度为 cached+new，从而构成 extend）
+- **sparse_prefill / EXTEND**（两端均为 absorbed + sparse，已对齐 DSA 实际路径）
+  - FlashMLA：`flash_mla_sparse_fwd`，q `(s_q, H, 576)` bf16，kv `(s_kv, 1, 576)` bf16，
+    indices `(s_q, 1, topk)`（s_q = new // cp_size，s_kv = cached + new）
+  - trtllm：`trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k=topk)`，
+    q `(1, s_q, H, 576)` bf16 absorbed，kv 为 latent paged cache
+    `(num_blocks, 1, 64, 576)` bf16，block_tables `(1, s_q, topk)` 指向被选中的 KV
+  - 两端 head_dim 同为 576、输出 512、均只 attend topk 个 KV
 
-## 5. 当前已知问题（公平性）
+## 5. 公平性：一次重要修正
 
-这是本基准目前最需要注意的部分。**FlashMLA 与 trtllm 在 `sparse_prefill` 中并不是
-在做完全相同的运算**，存在以下差异：
+### 5.1 修正的问题（曾经的错误）
 
-### 5.1 sparse 与 dense 不同
+早先版本的 `sparse_prefill` 在 trtllm 一侧调用了**错误的 API**：用了
+`flashinfer.prefill.trtllm_ragged_attention_deepseek`，这是 **V3（普通 MLA）的
+dense ragged MHA 路径**，需要先用 `kv_b_proj` 把 latent 展开成 192/128 的普通
+K/V。这与 FlashMLA 的 absorbed sparse 路径在三个方面都不对等：
 
-- FlashMLA 走 `flash_mla_sparse_fwd`，是 **sparse**：只 attend topk（2048）个 KV。
-- trtllm 走 `trtllm_ragged_attention_deepseek`，是 **dense**：attend 整段 KV。
+- sparse vs dense（FlashMLA 只读 topk，trtllm 读整段）
+- absorbed vs unfolded（trtllm 多了一次 `kv_b_proj` 展开 GEMM，且本基准没计入）
+- 维度不一致（576/512 vs 192/128）
 
-当 KV 很长（如 100k）而 topk=2048 时，二者的计算量相差可达数十倍。也就是说当前
-对比在计算量上对 FlashMLA 有利（读得少），但即便如此，小尺寸下实测 FlashMLA 仍更慢，
-这一点本身值得记录。
+### 5.2 正确路径（V3.2 / DSA）
 
-### 5.2 absorbed 与 unfolded 不同，且 trtllm 漏算了 kv_b_proj
+核查 sglang 中 DSA 的实际代码（`dsa_backend.py:_forward_trtllm`，prefill 时以
+`is_prefill=True` 调用）后确认：**DSA 的 trtllm 路径并不调用 ragged dense kernel，
+而是与 decode 用同一个 absorbed-sparse MLA kernel**：
 
-MLA 的 latent 有两种处理方式：
+```python
+# dsa_backend.py:2152
+flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+    query=q,                       # absorbed, head_dim 576
+    kv_cache=kv,                   # latent KV（不展开）
+    sparse_mla_top_k=self.dsa_index_topk,   # sparse，只 attend topk
+    backend="trtllm-gen",
+)
+```
 
-- **absorbed（FlashMLA）**：把权重吸收到 query 一侧，直接在 latent 空间（576）做
-  attention，不展开 K/V。kernel 直接吃 latent。
-- **unfolded（trtllm）**：在进入 kernel 之前，模型层先用 `kv_b_proj` 把 latent
-  （`kv_a`, 512）展开成普通的 K/V（`forward_mha.py` 中
-  `kv = self.kv_b_proj(kv_a)` → k_nope/v，再 cat 出 192 维的 K）。kernel 只看到
-  普通 MHA（q/k/v = 192/192/128），并不知道这来自 MLA latent。
+即在 DSA 中，trtllm 也用 absorbed latent（576）+ topk sparse，且同样是“用 decode
+API 做 prefill”（`is_prefill` 只影响 page table 的变换方式）。
 
-由此带来一个测量上的偏差：trtllm 路径在实际部署中包含一次 **`kv_b_proj` 的展开
-GEMM**，而本基准只测了 attention kernel，没有计入这次 GEMM。也就是说：
+### 5.3 修正后的状态
 
-- FlashMLA 总开销 ≈ attention kernel
-- trtllm 总开销 ≈ kv_b_proj GEMM + attention kernel
+`make_trtllm_sparse_prefill` 已改为调用
+`trtllm_batch_decode_with_kv_cache_mla(sparse_mla_top_k=topk)`，与 FlashMLA 对齐：
 
-当前基准把 trtllm 的展开成本漏掉了，对 trtllm 有利。若要做端到端（部署视角）的公平
-对比，需要把 `kv_b_proj` GEMM 计入 trtllm 路径。
+| 项 | FlashMLA（`flash_mla_sparse_fwd`） | trtllm（`trtllm_batch_decode_..._mla`） |
+|----|------------------------------------|------------------------------------------|
+| 计算类型 | absorbed + sparse(topk) | absorbed + sparse(topk) |
+| q head_dim | 576 | 576 |
+| 输出 head_dim | 512 | 512 |
+| KV 表示 | latent 576 | latent 576 |
+| kv_b_proj 展开 | 无 | 无 |
 
-### 5.3 输入数据独立生成
+5.1 中列出的三项不对等因此基本消除，`sparse_prefill` 成为同一运算的 kernel 对比。
+`sparse_decode` 模式此前已使用正确的 API，无需改动。
 
-两个后端各自用独立的随机张量，因此 `sparse_prefill` 无法做 cosine diff 交叉校验。
-这对时间测量影响不大，但无法验证两者是否在算“同一件事”。
+### 5.4 仍存在的次要限制
 
-### 5.4 维度不一致
+- **输入数据独立生成**：两端用各自的随机张量，因此 `sparse_prefill` /
+  `sparse_decode` 仍无法做 cosine diff 数值校验（只比时间，不验证数值一致）。
+- **decode/prefill_absorbed 的 dense 路径**：这两个模式在 B300 上 FlashMLA dense
+  decode kernel 不存在，仍为 `n/a`，这是设备能力的结论而非公平性问题。
 
-| 项 | FlashMLA（absorbed sparse） | trtllm（unfolded dense） |
-|----|----------------------------|--------------------------|
-| q head_dim | 576 | 192 |
-| 输出 head_dim | 512 | 128 |
-| KV 读取 | topk × 576 | full × 192 × H |
+## 6. 后续可选项
 
-## 6. 可选的修正方向
-
-针对第 5 节的问题，有三个方向：
-
-1. **两端都用 dense（apples-to-apples）**：FlashMLA 改用其 dense prefill kernel
-   （`dense_prefill_fwd`，对应 SM100 的 `fmha_cutlass_fwd_sm100.cu`），与 trtllm
-   ragged 同为 full attention，计算量一致，且可做 cosine diff 校验。
-2. **两端都用 sparse**：确认 `flashinfer` 的 prefill 接口是否提供 sparse top-k
-   参数；若有，则两端都做 topk sparse。
-3. **保持现状，但明确标注**：在输出与文档中写明“FlashMLA=sparse、trtllm=dense，
-   且 trtllm 未计入 kv_b_proj 展开成本”，把当前对比定位为“sglang 中两条可选路径的
-   对比”，而非“同一运算的 kernel 对决”。
+1. **数值校验**：让两端共享同一份 latent KV 与 topk indices，从而可做 cosine diff，
+   验证两个 kernel 输出一致（目前只验证时间）。
+2. **端到端口径**：如需对比整条注意力路径而非单个 kernel，可把 RoPE、KV 写入、
+   topk indexer 等前后处理一并计入。当前仅测 attention kernel。
 
 ## 7. 文件说明
 
