@@ -71,14 +71,28 @@ python bench_mla_kernels.py --mode decode --seq-k 32768 --batch 1 \
     --trace trace_decode_32k.json
 #    -> feed trace_decode_32k.json to the `llm-torch-profiler-analysis` skill
 
-# 5) Run everything at once
+# 5) Run everything at once, and save a CSV
 python bench_mla_kernels.py --mode all \
-    --batch 1 --seq-k 4096 16384 32768 --seq-q 2048 8192 --heads 128
+    --batch 1 --seq-k 4096 16384 32768 --seq-q 2048 8192 --heads 128 \
+    --csv results.csv
 
-# 6) End-to-end with CP actually enabled, per backend
+# 6) Full sweep helper: writes per-regime logs + CSVs and a combined CSV
+bash run_all.sh                 # results/<stamp>_*.log, *.csv, *_combined.csv
+
+# 7) End-to-end with CP actually enabled, per backend
 BACKEND=flashmla    bash profile_e2e_cp.sh
 BACKEND=trtllm_mla  bash profile_e2e_cp.sh
 ```
+
+### CSV output (`--csv`)
+
+Any run can append `--csv <path>` to dump every benchmarked shape as a table.
+Columns: `mode, batch, s_q, s_kv, heads, dtype, a_backend, a_ms, a_note,
+b_backend, b_ms, b_note, speedup_a_over_b, cos_diff`. A backend that had no
+kernel for the shape leaves `*_ms` empty and records the reason in `*_note`
+(e.g. `Dense decode MLA is only supported on SM90a`), so the CSV doubles as a
+record of which paths exist on this device. `run_all.sh` writes one CSV per
+regime plus a merged `<stamp>_combined.csv`.
 
 `--heads` is q-heads after TP: 128 for TP=1, 16 for TP=8, etc. Pick the value
 matching the deployment you're comparing.

@@ -580,6 +580,8 @@ def run_sparse_prefill(args):
                       f"{_fmt(r_tg):>12} {sp:>8.2f}")
                 _print_note_lines(b, f"B={b} S_Q={s_q} H={h}", r_fm, r_tg)
                 rows.append((b, s_q, h, r_fm, r_tg, sp))
+                _record("sparse_prefill", b, s_q, s_kv, h, "bf16", r_fm, r_tg,
+                        "flashmla_sparse_prefill", "trtllm_ragged_prefill")
     return rows
 
 
@@ -616,6 +618,8 @@ def run_sparse_decode(args):
                       f"{sp:>8.2f}")
                 _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, r_tg)
                 rows.append((b, s_k, h, r_fm, r_tg, sp))
+                _record("sparse_decode", b, 1, s_k, h, "fp8kv", r_fm, r_tg,
+                        "flashmla_sparse_decode", "trtllm_sparse_decode")
     return rows
 
 
@@ -677,6 +681,8 @@ def run_decode(args):
                       f"{sp:>8.2f} {cd:>10.2e}")
                 _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, r_tg)
                 rows.append((b, s_k, h, r_fm, r_tg, sp, cd))
+                _record("decode", b, 1, s_k, h, args.dtype, r_fm, r_tg,
+                        "flashmla_decode", "trtllm_decode", cos=cd)
     return rows
 
 
@@ -700,6 +706,8 @@ def run_prefill_absorbed(args):
                       f"{_fmt(r_tg):>12} {sp:>8.2f} {cd:>10.2e}")
                 _print_note_lines(b, f"B={b} S_Q={s_q} H={h}", r_fm, r_tg)
                 rows.append((b, s_q, h, r_fm, r_tg, sp, cd))
+                _record("prefill_absorbed", b, s_q, s_q, h, args.dtype, r_fm, r_tg,
+                        "flashmla_decode_kernel", "trtllm_decode", cos=cd)
     return rows
 
 
@@ -734,10 +742,55 @@ def run_prefill_ragged(args):
                 print(f"{b:>4} {s_q:>7} {h:>4} | {_fmt(r_fi):>14} {_fmt(r_tg):>12} "
                       f"{sp:>8.2f} {cd:>10.2e}")
                 rows.append((b, s_q, h, r_fi, r_tg, sp, cd))
+                _record("prefill_ragged", b, s_q, s_q, h, args.dtype, r_fi, r_tg,
+                        "flashinfer_ragged", "trtllm_ragged", cos=cd)
     return rows
 
 
 # small helpers
+# CSV accumulator: every benchmarked shape appends one normalized record here,
+# and main() writes them all out if --csv is given.
+_CSV_ROWS: list[dict] = []
+
+
+def _record(mode, b, s_q, s_kv, h, dtype, r_a, r_b,
+            a_name="flashmla", b_name="trtllm", cos=float("nan")):
+    """Append one normalized result row for CSV export.
+
+    r_a / r_b are TimeResult for the two backends being compared in this mode.
+    speedup = a_ms / b_ms (>1 means backend A is slower)."""
+    sp = (r_a.ms / r_b.ms) if (r_a.ok and r_b.ok) else float("nan")
+    _CSV_ROWS.append({
+        "mode": mode,
+        "batch": b,
+        "s_q": s_q,
+        "s_kv": s_kv,
+        "heads": h,
+        "dtype": dtype,
+        "a_backend": a_name,
+        "a_ms": f"{r_a.ms:.4f}" if r_a.ok else "",
+        "a_note": "" if r_a.ok else (r_a.note or "unavailable"),
+        "b_backend": b_name,
+        "b_ms": f"{r_b.ms:.4f}" if r_b.ok else "",
+        "b_note": "" if r_b.ok else (r_b.note or "unavailable"),
+        "speedup_a_over_b": f"{sp:.4f}" if sp == sp else "",  # NaN check
+        "cos_diff": f"{cos:.3e}" if cos == cos else "",
+    })
+
+
+def _write_csv(path):
+    import csv
+    if not _CSV_ROWS:
+        print("[csv] no rows to write")
+        return
+    fields = list(_CSV_ROWS[0].keys())
+    with open(path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        w.writerows(_CSV_ROWS)
+    print(f"\n[csv] wrote {len(_CSV_ROWS)} rows -> {path}")
+
+
 def _fmt(r: TimeResult) -> str:
     return f"{r.ms:.3f}" if r.ok else "n/a"
 
@@ -794,6 +847,8 @@ def main():
     p.add_argument("--dtype", choices=list(_DTYPES), default="bf16")
     p.add_argument("--trace", type=str, default=None,
                    help="export a chrome trace of one representative iter")
+    p.add_argument("--csv", type=str, default=None,
+                   help="write all results as a CSV to this path")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
@@ -821,6 +876,9 @@ def main():
         run_sparse_decode(args)
     if args.mode in ("sparse_prefill", "all"):
         run_sparse_prefill(args)
+
+    if args.csv:
+        _write_csv(args.csv)
 
     if args.trace:
         # Trace one representative case. For prefill_* modes use s_q (q_len>1);

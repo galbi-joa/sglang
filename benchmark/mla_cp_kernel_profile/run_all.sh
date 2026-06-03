@@ -19,12 +19,13 @@ STAMP=$(date +%Y%m%d_%H%M%S)
 
 run() {
   local name="$1"; shift
+  local csv="$OUT/${STAMP}_${name}.csv"
   echo ""
   echo "############################################################"
   echo "# $name"
-  echo "# python bench_mla_kernels.py $*"
+  echo "# python bench_mla_kernels.py $* --csv $csv"
   echo "############################################################"
-  python bench_mla_kernels.py "$@" 2>&1 | tee "$OUT/${STAMP}_${name}.log"
+  python bench_mla_kernels.py "$@" --csv "$csv" 2>&1 | tee "$OUT/${STAMP}_${name}.log"
 }
 
 echo "=== Full MLA kernel sweep  ($STAMP) ==="
@@ -55,5 +56,20 @@ run "sparse_prefill" --mode sparse_prefill --batch 1 --seq-q $SEQ_Q --heads $HEA
 
 echo ""
 echo "=== Done. Per-regime logs under $OUT/${STAMP}_*.log ==="
+echo "Per-regime CSVs under $OUT/${STAMP}_*.csv"
+
+# Merge all per-regime CSVs into one combined file (single header).
+COMBINED="$OUT/${STAMP}_combined.csv"
+first=1
+for f in "$OUT"/${STAMP}_*.csv; do
+  [ -e "$f" ] || continue
+  if [ $first -eq 1 ]; then
+    cat "$f" > "$COMBINED"; first=0
+  else
+    tail -n +2 "$f" >> "$COMBINED"   # skip header on subsequent files
+  fi
+done
+[ -e "$COMBINED" ] && echo "Combined CSV: $COMBINED"
+
 echo "Summary of the headline numbers:"
 grep -hE "^\s*[0-9]+\s+[0-9]+" "$OUT"/${STAMP}_*.log 2>/dev/null || true
