@@ -113,26 +113,66 @@ speedup = flashmla_ms / trtllm_ms。**小于 1 表示 FlashMLA 更快。**
 | 10000 | 100000 | 5.525  | 5.987  | 0.92 |
 | 20000 | 110000 | 11.150 | 12.181 | 0.92 |
 
+### 3.4 sparse_decode（q_len=1, fp8 KV, H=128）
+
+注意：decode 的 q_len=1，与 prefill（q_len 大）方向相反。
+
+| B | S_K | flashmla(ms) | trtllm(ms) | speedup |
+|---|-----|--------------|------------|---------|
+| 1  | 4096  | 0.039 | 0.016 | 2.37 |
+| 1  | 16384 | 0.037 | 0.016 | 2.25 |
+| 1  | 32768 | 0.037 | 0.016 | 2.26 |
+| 4  | 4096  | 0.045 | 0.018 | 2.44 |
+| 4  | 16384 | 0.045 | 0.020 | 2.21 |
+| 4  | 32768 | 0.045 | 0.021 | 2.20 |
+| 16 | 4096  | 0.049 | 0.023 | 2.18 |
+| 16 | 16384 | 0.049 | 0.025 | 1.99 |
+| 16 | 32768 | 0.049 | 0.025 | 2.00 |
+
+在 q_len=1 的 decode 下，**trtllm 反而快约 2 倍**。绝对时间都很小
+（0.016~0.049ms），此时固定开销（launch / 元数据）占主导，而非实际计算量。
+
+### 3.5 q_len 扫描：交叉点（cached=90000, cp=1, H=128）
+
+固定 KV，仅改变 query 长度，观察 speedup 随 q_len 的变化：
+
+| new (q_len) | flashmla(ms) | trtllm(ms) | speedup |
+|-------------|--------------|------------|---------|
+| 1    | 0.033 | 0.016 | 2.00 |
+| 16   | 0.041 | 0.027 | 1.54 |
+| 64   | 0.051 | 0.047 | 1.09 |
+| 256  | 0.147 | 0.152 | 0.97 |
+| 1024 | 0.476 | 0.583 | 0.82 |
+| 4096 | 2.199 | 2.379 | 0.92 |
+
+**交叉点在 q_len ≈ 64~256 之间**：q_len < 64 时 trtllm 更快，q_len ≥ 256 时
+FlashMLA 更快，q_len≈64 时基本持平（1.09）。
+
 ## 4. 结论与观察
 
-1. **与最初 claim 相反：在这个公平的 sparse prefill / extend 对比中，FlashMLA
-   并不比 trtllm-gen 慢，反而稳定快约 8~13%（speedup 0.87~0.92）。** 各种
-   context 长度、CP size、new token 数下，比值都在 ~0.9 附近，趋势一致。
+1. **谁更快取决于 q_len（即 decode vs prefill）**，不能一概而论：
+   - **q_len 小（decode / 短 extend，< ~64）**：trtllm 更快，q_len=1 时约 2 倍。
+   - **q_len 大（prefill / 长 extend，≥ ~256）**：FlashMLA 更快，约 8~18%。
+   - 交叉点约在 q_len 64~256。
 
-2. **为什么和早先的“flashmla 慢 4.5 倍”相反**：那次是 sparse(flashmla) 对
-   dense ragged(trtllm) 的错误 API 比较；本次两端都用正确的 DSA absorbed-sparse
-   API，结论因此反转。说明之前的“慢”是比较口径错误造成的，而非 kernel 本身。
+2. **物理解释**：q_len 小时，绝对时间很小（几十微秒），由固定开销
+   （kernel launch / 元数据）主导，trtllm 的固定开销更低；q_len 大时，由实际
+   attention 计算量主导，FlashMLA 的 sparse kernel 在 B300 上算得略快。
 
-3. **对 KV 长度不敏感**：KV 从 40k 增到 510k，flashmla 仅从 4.66 增到 6.00ms。
-   这符合 sparse 的特性——只 attend topk=2048，与总 KV 长度基本无关（轻微增长
-   来自更长 KV 上 gather 选中 token 的开销）。
+3. **关于最初 claim**：导师“flashmla 比 trtllm 慢”的说法**在 decode（q_len 小）
+   时成立，在 prefill（q_len 大）时相反**。而早先测到的“慢 4.5 倍”是用了错误的
+   API（sparse 对 dense ragged）造成的，并非 kernel 本身——见第 1.1 节。
 
-4. **主要成本来自 q_len**：new 从 1000 增到 20000，时间从 0.47 增到 11.15ms，
-   近似线性；CP 把 q 切小后时间也近似成比例下降（q/rank 10000→1250，
-   5.35→0.58ms）。说明这个 sparse 场景下，计算量主要由 query token 数决定。
+4. **对 KV 长度不敏感**：无论 decode 还是 prefill，KV 从几 k 增到 500k+，时间
+   几乎不变（sparse 只 attend topk=2048）。主要成本来自 q_len。
 
-5. **正确性**：`--verify` 下 cos_diff = 2.666e-06，两个 kernel 在共享输入下
-   输出一致，上述时间对比有效。
+5. **CP 不改变结论**：CP 只是把 new token 切到各 rank，两个 kernel 的 q 同等
+   变小，speedup 比值在 cp=1~8 下保持 ~0.9 不变（见 3.2）。即 FlashMLA 在
+   prefill 更快是 kernel 本身的特性，与 CP 无关。
+
+6. **正确性**：sparse_prefill 在 `--verify` 下 cos_diff = 2.666e-06，两个 kernel
+   共享输入时输出一致，时间对比有效。sparse_decode 的 2 倍差异尚未做同样的
+   cos_diff 校验，是后续应补的一项。
 
 ## 5. 限制
 
