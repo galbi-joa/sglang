@@ -524,14 +524,18 @@ def make_trtllm_sparse_decode(cache_seqlens, idx, b, s_k, h_q, kv_fp8):
     return run, ""
 
 
-def make_flashmla_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
+def make_flashmla_sparse_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0):
     """FlashMLA sparse PREFILL (extend) via flash_mla_sparse_fwd. This is the
     'use the FlashMLA kernel for prefill' path the mentor pointed at.
 
-    Extend semantics: s_q new query tokens attend to s_kv total KV rows
-    (s_kv = cached_prefix + new). For a CP run, pass the per-rank q length
-    (s_q already divided by cp_size by the caller). q/kv are bf16; indices are
-    [s_q, h_kv=1, topk] int32 into the s_kv KV rows. (sgl_kernel flash_mla.py:310)
+    Extend semantics: b requests, each of s_q new query tokens, attend to s_kv
+    total KV rows (s_kv = cached_prefix + new). flash_mla_sparse_fwd takes a flat
+    (rows, H, d_qk) query, so b requests = b*s_q query rows sharing the one latent
+    KV. (Sparse reads only topk rows per query, so a shared vs per-request KV is
+    the same KV-read traffic -- representative for timing.) For a CP run, pass the
+    per-rank q length (s_q already divided by cp_size by the caller). q/kv are
+    bf16; indices are [rows, h_kv=1, topk] int32 into the s_kv KV rows.
+    (sgl_kernel flash_mla.py:310)
     """
     try:
         from sgl_kernel.flash_mla import flash_mla_sparse_fwd
@@ -543,11 +547,12 @@ def make_flashmla_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
     # head64/head128 instantiations); pad like dsa_backend does on Blackwell.
     pad_to = 128 if device_cap()[0] >= 10 else 64
     h_pad = ((h_q + pad_to - 1) // pad_to) * pad_to
+    rows = b * s_q  # b requests x s_q query rows each (flat query layout)
 
-    q = (torch.randn(s_q, h_pad, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    q = (torch.randn(rows, h_pad, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
     kv = (torch.randn(s_kv, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
     eff_topk = min(topk, s_kv)
-    idx = torch.randint(0, s_kv, (s_q, 1, eff_topk), dtype=torch.int32, device=device)
+    idx = torch.randint(0, s_kv, (rows, 1, eff_topk), dtype=torch.int32, device=device)
 
     def run():
         out, _, _ = flash_mla_sparse_fwd(
@@ -558,7 +563,7 @@ def make_flashmla_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
     return run, ""
 
 
-def make_trtllm_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
+def make_trtllm_sparse_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0):
     """trtllm-gen sparse prefill / EXTEND -- the CORRECT V3.2 (DSA) path.
 
     dsa_backend.py:_forward_trtllm (used for DSA prefill with is_prefill=True)
@@ -568,24 +573,29 @@ def make_trtllm_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
     comparison against flash_mla_sparse_fwd, trtllm must also use absorbed latent
     (head_dim 576) + topk sparse, not the unfolded 192-dim ragged MHA.
 
-    Extend: s_q new query rows attend to s_kv total KV (cached + new), of which
-    only topk are selected. q is bf16 absorbed (b, s_q, H, 576); kv is the bf16
-    latent paged cache (num_blocks, 1, page_size, 576)."""
+    Extend: b requests, each of s_q new query rows, attend to s_kv total KV
+    (cached + new), of which only topk are selected. q is bf16 absorbed
+    (b, s_q, H, 576); kv is the bf16 latent paged cache shared across the batch
+    (num_blocks, 1, page_size, 576). Heads are padded to the same 64/128 multiple
+    as FlashMLA so both kernels do equal per-call work (fair for non-128 heads)."""
     fi = try_import_flashinfer()
     if fi is None:
         return None, "flashinfer unavailable"
     torch.manual_seed(seed)
     eff_topk = min(topk, s_kv)
-    # absorbed query: head_dim = 576, q_len = s_q (>1 for prefill/extend)
-    q = torch.randn(1, s_q, h_q, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
-    # latent paged KV covering s_kv tokens (cached + new), page_size 64.
+    pad_to = 128 if device_cap()[0] >= 10 else 64
+    h_pad = ((h_q + pad_to - 1) // pad_to) * pad_to
+    # absorbed query: head_dim = 576, q_len = s_q (>1 for prefill/extend), batch b
+    q = torch.randn(b, s_q, h_pad, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    # latent paged KV covering s_kv tokens (cached + new), page_size 64, shared
+    # across the batch (sparse only reads topk rows per query -> same traffic).
     nblk = (s_kv + PAGE_SIZE - 1) // PAGE_SIZE
     kv = (torch.randn(nblk, 1, PAGE_SIZE, HEAD_DIM_CKV,
                       dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
     # block_tables: per (batch, q_row) topk positions into the KV. page_size 1
     # selection like dsa_backend's transformed page table.
-    block_tables = torch.randint(0, s_kv, (1, s_q, eff_topk), dtype=torch.int32, device=device)
-    seq_lens = torch.tensor([s_kv], dtype=torch.int32, device=device)
+    block_tables = torch.randint(0, s_kv, (b, s_q, eff_topk), dtype=torch.int32, device=device)
+    seq_lens = torch.full((b,), s_kv, dtype=torch.int32, device=device)
     workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
 
     def run():
@@ -693,8 +703,8 @@ def run_sparse_prefill(args):
                               f"flashmla{sfm} vs trtllm{stg}")
                     else:
                         print(f"    [verify] {res}")
-                fm, fm_note = make_flashmla_sparse_prefill(q_per_rank, kv_tot, h, DSA_TOPK)
-                tg, tg_note = make_trtllm_sparse_prefill(q_per_rank, kv_tot, h, DSA_TOPK)
+                fm, fm_note = make_flashmla_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
+                tg, tg_note = make_trtllm_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
                 r_fm = time_kernel("flashmla_sparse_prefill", fm) if fm else TimeResult("flashmla", False, note=fm_note or "unavailable")
                 r_tg = time_kernel("trtllm_sparse_prefill", tg) if tg else TimeResult("trtllm", False, note=tg_note or "unavailable")
                 sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
@@ -859,12 +869,18 @@ def run_prefill_ragged(args):
                 r_fi = time_kernel("fi_ragged", fi_run) if fi_run else TimeResult("fi_ragged", False, note="unavailable")
                 r_tg = time_kernel("trtllm", tg_run) if tg_run else TimeResult("trtllm", False, note="unavailable")
 
-                out_fi = fi_run() if fi_run else None
-                out_tg = tg_run() if tg_run else None
+                # Cross-check only when BOTH timed cleanly; re-calling a runner
+                # that errored during timing would re-raise and abort the sweep
+                # (same guard as _bench_absorbed_pair). _safe_call swallows any
+                # straggler error so a bad shape can't kill the whole run.
                 cd = float("nan")
-                if out_fi is not None and out_tg is not None:
-                    o_tg = out_tg[0] if isinstance(out_tg, (tuple, list)) else out_tg
-                    cd = cos_diff(out_fi.reshape(b * s_q, h, -1), o_tg.reshape(b * s_q, h, -1))
+                if r_fi.ok and r_tg.ok:
+                    out_fi = _safe_call(fi_run)
+                    out_tg = _safe_call(tg_run)
+                    if out_fi is not None and out_tg is not None:
+                        o_tg = out_tg[0] if isinstance(out_tg, (tuple, list)) else out_tg
+                        cd = cos_diff(out_fi.reshape(b * s_q, h, -1),
+                                      o_tg.reshape(b * s_q, h, -1))
 
                 sp = (r_fi.ms / r_tg.ms) if (r_fi.ok and r_tg.ok) else float("nan")
                 print(f"{b:>4} {s_q:>7} {h:>4} | {_fmt(r_fi):>14} {_fmt(r_tg):>12} "
