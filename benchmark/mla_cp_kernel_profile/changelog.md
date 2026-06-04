@@ -69,15 +69,60 @@ KV，并按 64/128 对 head 数做 padding（Blackwell 上为 128，与 dsa_back
 - 实测 `cos_diff = 2.666e-06`（[OK]），说明两个 kernel 在共享输入下输出一致，
   时间比较因此有效。
 
-### 1.5 sparse_decode 的 KV dtype 对齐（fp8）
+### 1.5 sparse_decode 的 dtype 对齐（fp8）—— 含一次根因修正
 
 发现一处不公平：sparse_decode 中 FlashMLA 用 **fp8** KV（`quantize_k_cache` +
 `is_fp8_kvcache=True`，与 DSA 实际一致），而 trtllm 之前用的是 **bf16** KV。
 fp8 数据只有一半大小，内存读取更省，两端精度不一致会影响对比。
 
-修改：`make_trtllm_sparse_decode` 改为接收 **fp8** KV（latent 直接 cast 到
-float8_e4m3fn，bmm1_scale 取 1×scale）。现在 sparse_decode 两端都读 fp8 KV，
-内存流量对等。
+**第一次尝试（错误，需更正之前的描述）**：只把 `make_trtllm_sparse_decode` 的
+KV cast 成 fp8、query 仍保持 bf16。结果 trtllm 在 B300 上直接报错（不是算错，而是
+**根本没派发出 kernel**）：
+
+```
+Missing TRTLLM-GEN kernel (decode): ... headDimQk=576, headDimV=512,
+sparseMlaType=1, numTokensPerPage=1, multiCtasKvMode=2 ...
+```
+
+**根因（核查 flashinfer + sglang 源码后确认，下列三点纠正了早先的猜测）**：
+
+1. `Missing TRTLLM-GEN kernel` 是 **kernel 派发未命中（找不到对应 cubin）**，
+   不是 KV 布局/形状不匹配。布局错只会触发 shape 断言或算出错误数值，绝不会报
+   "Missing kernel"。所以"两个 kernel 的 fp8 布局根本不兼容"这一推断方向是错的。
+
+2. **真正的差异是 query dtype**：flashinfer 的
+   `trtllm_fmha_kernel_launcher.cu` 强制 **query dtype 必须等于 KV dtype**
+   （`ICHECK_EQ(kv_data_type, q_data_type)`，且二者只能是 BF16 或 FP8 E4M3）。
+   `bf16 query + fp8 KV` 是 trtllm-gen 根本没编译过的混合精度组合，所以派发失败。
+   之前 bf16 能跑（0.016ms），正是因为那时 query 与 KV **都是 bf16**（一致）；
+   只改 KV 不改 query，才人为制造了不一致。
+
+3. sglang 的 DSA fp8 decode 路径本来就是 **fp8 query + fp8 KV**：
+   `dsa_backend.py:2079` 调用 `mla_quantize_and_rope_for_fp8`，把 **query 也量化为
+   fp8**（返回的 `merged_q_out` 为 `float8_e4m3fn`，见 `utils.py:425`）。所以
+   production 的这条路 dtype 一致、cubin 存在、能跑。
+
+**修正（正确）**：`make_trtllm_sparse_decode` 的 query 也 cast 到 fp8，与 fp8 KV
+对齐，从而与 production 的 fp8 路径一致。
+
+**关于 KV 布局——trtllm 的 fp8 KV 不是 FlashMLA 的 packed 布局**：FlashMLA 用
+`quantize_k_cache` 的 packed 布局（512 fp8 nope + 每 tile 4B scale + bf16 rope，
+共 656 字节/行），而 trtllm 保持 **576 宽的平铺 fp8**——`calculate_mla_kv_cache_dim`
+对 trtllm 后端**不做 override**，直接返回 `kv_lora_rank + qk_rope_head_dim = 576`
+（`model_runner_kv_cache_mixin.py:193-201`，注释 "excluding TRTLLM"）。因此本基准
+给 trtllm 的"平铺 fp8 cast"恰好与 production 一致，无需复现 packed 布局。
+`numTokensPerPage=1` 同样是 sparse MLA 的固有特征（topk 索引为 token 级，
+`transform_index_page_table_decode(page_size=1)`），production 也是如此，并非问题。
+
+**两端 dtype 总结（各自的 native fp8 路径，正是 production 的样子）**：
+
+| backend | query | KV |
+|---------|-------|----|
+| flashmla sparse decode | **bf16** | fp8（quantize_k_cache packed，656B） |
+| trtllm  sparse decode  | **fp8**  | fp8（平铺 576） |
+
+query dtype 不同**不是"不公平"**，而是两个 kernel 在 fp8 下各自的真实路径；
+"fp8/fp8 比较不可能"这一结论是错的——production 每天都在跑 trtllm 的 fp8/fp8。
 
 说明：**sparse_prefill 无法改 fp8**——其 FlashMLA kernel `flash_mla_sparse_fwd`
 的文档明确要求 KV 为 bfloat16（`kv: [s_kv, h_kv, d_qk], bfloat16`），所以
@@ -129,9 +174,11 @@ speedup = flashmla_ms / trtllm_ms。**小于 1 表示 FlashMLA 更快。**
 
 ### 3.4 sparse_decode（q_len=1, H=128）
 
-注意：以下数据是在 **trtllm 仍用 bf16 KV** 时测的（见 1.5），当时 FlashMLA 用
-fp8、trtllm 用 bf16，dtype 不对等。1.5 已把 trtllm 改为 fp8，**这组数字需要在
-两端均 fp8 后重测**。decode 的 q_len=1，方向与 prefill（q_len 大）相反。
+注意：以下数据是在 **trtllm 仍用 bf16（query+KV 都 bf16）** 时测的，当时 FlashMLA
+用 fp8、trtllm 用 bf16，dtype 不对等。1.5 已把 trtllm 改为 **fp8 query + fp8 KV**
+（query 与 KV dtype 必须一致，见 1.5；这才与 production 的 DSA fp8 路径相同），
+**这组数字需要在该修正后于 B300 重测**。decode 的 q_len=1，方向与 prefill（q_len
+大）相反。
 
 | B | S_K | flashmla(ms) | trtllm(ms) | speedup |
 |---|-----|--------------|------------|---------|

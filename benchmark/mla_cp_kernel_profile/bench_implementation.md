@@ -97,9 +97,13 @@ DSA topk  = 2048
   - q/k: `(T, H, 192)`，v: `(T, H, 128)`，T 为 batch 内所有 query token 之和
   - 用 `cu_seqlens` 表示 ragged 边界
 
-- **sparse_decode（fp8 KV）**
-  - q: `(B, 1, H, 576)` bf16（仅 K cache 量化为 fp8，q 保持 bf16）
-  - kv: 经 `quantize_k_cache` 量化后的 fp8 布局
+- **sparse_decode（fp8 KV）**——两端 q dtype 不同，各自的 native fp8 路径：
+  - FlashMLA：q `(B, 1, H, 576)` **bf16** + K cache `quantize_k_cache` packed fp8
+    （`is_fp8_kvcache=True`；其 native 路径就是 bf16 q + fp8 K）
+  - trtllm：q `(B, 1, H, 576)` **fp8** + 平铺 576 fp8 KV。trtllm-gen 强制
+    `query dtype == KV dtype`（flashinfer launcher 的 `ICHECK_EQ`），bf16 q + fp8 KV
+    会因找不到 cubin 而报 `Missing TRTLLM-GEN kernel`；production 经
+    `mla_quantize_and_rope_for_fp8` 把 q 也量化为 fp8，故此处 q 用 fp8。
   - indices: `(B, 1, topk)` int32，指向被选中的 KV 行
   - head 数会按 64/128 的倍数 padding（与 dsa_backend 在 Blackwell 上的处理一致）
 
