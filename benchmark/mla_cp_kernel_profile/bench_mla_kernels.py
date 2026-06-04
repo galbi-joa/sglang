@@ -580,6 +580,59 @@ def make_trtllm_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
     return run, ""
 
 
+def _verify_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
+    """Cross-check that flash_mla_sparse_fwd and the trtllm sparse MLA kernel
+    compute the SAME thing on a SHARED input: same latent KV, same topk picks,
+    same q. Returns (cos_diff, fm_shape, tg_shape) or a string note on failure.
+
+    Layout bridge: with page_size=64 the trtllm paged KV (nblk,1,64,576)
+    flattened over (nblk,64) equals the flat KV (nblk*64, 1, 576) flashmla reads.
+    So we allocate one flat KV, view it both ways, and use the SAME absolute
+    token indices for both (block_table with page_size=1 == absolute positions)."""
+    try:
+        from sgl_kernel.flash_mla import flash_mla_sparse_fwd
+    except Exception as e:  # noqa: BLE001
+        return f"flashmla unavailable: {e}"
+    fi = try_import_flashinfer()
+    if fi is None:
+        return "flashinfer unavailable"
+
+    torch.manual_seed(seed)
+    nblk = (s_kv + PAGE_SIZE - 1) // PAGE_SIZE
+    s_kv_pad = nblk * PAGE_SIZE
+    eff_topk = min(topk, s_kv)
+
+    # one shared latent KV; the trtllm paged view is just a reshape of the flat one
+    kv_flat = (torch.randn(s_kv_pad, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    kv_paged = kv_flat.view(nblk, PAGE_SIZE, 1, HEAD_DIM_CKV).permute(0, 2, 1, 3).contiguous()  # (nblk,1,64,576)
+
+    # shared q (note: flashmla wants head padded to 128; we keep h_q a multiple of it)
+    q_flat = (torch.randn(s_q, h_q, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    q_trt = q_flat.unsqueeze(0)  # (1, s_q, h_q, 576)
+
+    # shared topk: same absolute KV positions for each query row
+    idx = torch.randint(0, s_kv, (s_q, eff_topk), dtype=torch.int32, device=device)
+    idx_fm = idx.unsqueeze(1)              # (s_q, 1, topk) for flashmla
+    bt_trt = idx.unsqueeze(0)              # (1, s_q, topk) for trtllm
+
+    try:
+        o_fm, _, _ = flash_mla_sparse_fwd(
+            q=q_flat, kv=kv_flat, indices=idx_fm, sm_scale=SOFTMAX_SCALE, d_v=HEAD_DIM_V)
+        ws = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+        o_tg = fi.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=q_trt, kv_cache=kv_paged, workspace_buffer=ws,
+            qk_nope_head_dim=QK_NOPE_HEAD_DIM, kv_lora_rank=KV_LORA_RANK,
+            qk_rope_head_dim=QK_ROPE_HEAD_DIM, block_tables=bt_trt,
+            seq_lens=torch.tensor([s_kv], dtype=torch.int32, device=device),
+            max_seq_len=int(s_kv), sparse_mla_top_k=eff_topk,
+            bmm1_scale=SOFTMAX_SCALE, backend="trtllm-gen")
+        o_tg = o_tg[0] if isinstance(o_tg, (tuple, list)) else o_tg
+        cd = cos_diff(o_fm.reshape(s_q, h_q, -1), o_tg.reshape(s_q, h_q, -1))
+        return cd, tuple(o_fm.shape), tuple(o_tg.shape)
+    except Exception as e:  # noqa: BLE001
+        return f"verify failed: {_short_err(e)}"
+
+
 def run_sparse_prefill(args):
     """FlashMLA sparse prefill / EXTEND -- the 'FlashMLA kernel doing prefill'
     path the mentor pointed at, at realistic long-context sizes.
@@ -600,6 +653,19 @@ def run_sparse_prefill(args):
             for h in args.heads:
                 kv_tot = cached + new                 # total KV the query attends to
                 q_per_rank = max(1, new // cp)        # CP shards the new tokens
+                if args.verify:
+                    # numerical cross-check on a SHARED input (smaller q to keep
+                    # the reference cheap); confirms both kernels compute the same
+                    # thing before trusting the timing.
+                    v_sq = min(q_per_rank, 256)
+                    res = _verify_sparse_prefill(v_sq, min(kv_tot, 8192), h, DSA_TOPK)
+                    if isinstance(res, tuple):
+                        cd, sfm, stg = res
+                        ok = "OK" if (cd == cd and cd < 1e-2) else "MISMATCH"
+                        print(f"    [verify] cos_diff={cd:.3e} [{ok}]  "
+                              f"flashmla{sfm} vs trtllm{stg}")
+                    else:
+                        print(f"    [verify] {res}")
                 fm, fm_note = make_flashmla_sparse_prefill(q_per_rank, kv_tot, h, DSA_TOPK)
                 tg, tg_note = make_trtllm_sparse_prefill(q_per_rank, kv_tot, h, DSA_TOPK)
                 r_fm = time_kernel("flashmla_sparse_prefill", fm) if fm else TimeResult("flashmla", False, note=fm_note or "unavailable")
@@ -887,6 +953,9 @@ def main():
                    help="export a chrome trace of one representative iter")
     p.add_argument("--csv", type=str, default=None,
                    help="write all results as a CSV to this path")
+    p.add_argument("--verify", action="store_true",
+                   help="(sparse_prefill) cross-check both kernels on a shared "
+                   "input via cosine diff before timing")
     args = p.parse_args()
 
     if not torch.cuda.is_available():
