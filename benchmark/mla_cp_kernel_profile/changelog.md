@@ -69,7 +69,21 @@ KV，并按 64/128 对 head 数做 padding（Blackwell 上为 128，与 dsa_back
 - 实测 `cos_diff = 2.666e-06`（[OK]），说明两个 kernel 在共享输入下输出一致，
   时间比较因此有效。
 
-### 1.5 其他
+### 1.5 sparse_decode 的 KV dtype 对齐（fp8）
+
+发现一处不公平：sparse_decode 中 FlashMLA 用 **fp8** KV（`quantize_k_cache` +
+`is_fp8_kvcache=True`，与 DSA 实际一致），而 trtllm 之前用的是 **bf16** KV。
+fp8 数据只有一半大小，内存读取更省，两端精度不一致会影响对比。
+
+修改：`make_trtllm_sparse_decode` 改为接收 **fp8** KV（latent 直接 cast 到
+float8_e4m3fn，bmm1_scale 取 1×scale）。现在 sparse_decode 两端都读 fp8 KV，
+内存流量对等。
+
+说明：**sparse_prefill 无法改 fp8**——其 FlashMLA kernel `flash_mla_sparse_fwd`
+的文档明确要求 KV 为 bfloat16（`kv: [s_kv, h_kv, d_qk], bfloat16`），所以
+sparse_prefill 两端都用 bf16，本就一致，无需改动。
+
+### 1.6 其他
 
 - `--csv`：所有模式可导出统一表格（含每个 backend 的耗时、note、speedup）。
 - `run_all.sh`：一次跑完所有模式并合并出 `*_combined.csv`；sparse_prefill 默认
@@ -113,9 +127,11 @@ speedup = flashmla_ms / trtllm_ms。**小于 1 表示 FlashMLA 更快。**
 | 10000 | 100000 | 5.525  | 5.987  | 0.92 |
 | 20000 | 110000 | 11.150 | 12.181 | 0.92 |
 
-### 3.4 sparse_decode（q_len=1, fp8 KV, H=128）
+### 3.4 sparse_decode（q_len=1, H=128）
 
-注意：decode 的 q_len=1，与 prefill（q_len 大）方向相反。
+注意：以下数据是在 **trtllm 仍用 bf16 KV** 时测的（见 1.5），当时 FlashMLA 用
+fp8、trtllm 用 bf16，dtype 不对等。1.5 已把 trtllm 改为 fp8，**这组数字需要在
+两端均 fp8 后重测**。decode 的 q_len=1，方向与 prefill（q_len 大）相反。
 
 | B | S_K | flashmla(ms) | trtllm(ms) | speedup |
 |---|-----|--------------|------------|---------|

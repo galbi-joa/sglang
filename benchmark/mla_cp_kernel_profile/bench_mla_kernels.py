@@ -462,26 +462,25 @@ def make_flashmla_sparse_decode(q, kv_q, cache_seqlens, idx, h_q):
     return run, ""
 
 
-def make_trtllm_sparse_decode(kv_q_dim_kv, cache_seqlens, idx, b, s_k, h_q, kv_bf16):
-    """trtllm-gen sparse decode. dsa_backend.py:2152 calls
-    trtllm_batch_decode_with_kv_cache_mla with sparse_mla_top_k=topk and a
-    block_tables that already encodes the topk positions. We feed the topk
-    indices directly as the (page_size=1) block table."""
+def make_trtllm_sparse_decode(cache_seqlens, idx, b, s_k, h_q, kv_fp8):
+    """trtllm-gen sparse decode with an fp8 KV cache, matching FlashMLA's fp8 KV
+    so the comparison is at the same precision. dsa_backend.py:2152 calls
+    trtllm_batch_decode_with_kv_cache_mla with sparse_mla_top_k=topk; sglang
+    feeds the KV pool tensor whose dtype is kv_cache_dtype (fp8 in DSA), so we
+    pass an fp8-cast latent KV and a unit bmm1_scale (descale=1, inputs already
+    in range)."""
     fi = try_import_flashinfer()
     if fi is None:
         return None, "flashinfer unavailable"
     topk = idx.shape[-1]
     workspace = torch.empty(128 * 1024 * 1024, dtype=torch.int8, device="cuda")
-    # trtllm-gen MLA keeps q in bf16 and a bf16/fp8 paged kv cache laid out as
-    # (num_blocks, 1, page_size, kv_cache_dim). Use the same bf16 latent KV.
     q = torch.randn(b, 1, h_q, HEAD_DIM_CKV, dtype=torch.bfloat16, device="cuda")
-    # block_tables for sparse: (batch, 1, topk) of kv positions, page_size 1.
     block_tables = idx.view(b, 1, topk).to(torch.int32)
 
     def run():
         return fi.decode.trtllm_batch_decode_with_kv_cache_mla(
             query=q,
-            kv_cache=kv_bf16,
+            kv_cache=kv_fp8,
             workspace_buffer=workspace,
             qk_nope_head_dim=QK_NOPE_HEAD_DIM,
             kv_lora_rank=KV_LORA_RANK,
@@ -696,15 +695,18 @@ def run_sparse_decode(args):
                           f"{'-':>8}   (S_K < topk={DSA_TOPK})")
                     continue
                 q, kv_q, bt, cs, idx = build_sparse_inputs(b, s_k, h, DSA_TOPK)
-                # bf16 paged latent KV for the trtllm path (it does not take the
-                # fp8-packed layout FlashMLA uses).
+                # fp8 paged latent KV for the trtllm path, so BOTH backends read
+                # an fp8 KV cache (FlashMLA uses the quantize_k_cache fp8 layout;
+                # trtllm takes a plain fp8 cast). Same precision => fair memory
+                # traffic.
                 nblk = kv_q.shape[0]
-                kv_bf16 = (torch.randn(nblk, 1, PAGE_SIZE, HEAD_DIM_CKV,
-                                       dtype=torch.bfloat16, device="cuda") / 10).clamp_(-1, 1)
+                kv_fp8 = (torch.randn(nblk, 1, PAGE_SIZE, HEAD_DIM_CKV,
+                                      dtype=torch.bfloat16, device="cuda") / 10
+                          ).clamp_(-1, 1).to(FP8_DTYPE)
 
                 fm, fm_note = make_flashmla_sparse_decode(q, kv_q, cs, idx, h)
                 tg, tg_note = make_trtllm_sparse_decode(
-                    kv_q.shape, cs, idx, b, s_k, h, kv_bf16
+                    cs, idx, b, s_k, h, kv_fp8
                 )
                 r_fm = time_kernel("flashmla_sparse", fm) if fm else TimeResult("flashmla_sparse", False, note=fm_note or "unavailable")
                 r_tg = time_kernel("trtllm_sparse", tg) if tg else TimeResult("trtllm_sparse", False, note=tg_note or "unavailable")
