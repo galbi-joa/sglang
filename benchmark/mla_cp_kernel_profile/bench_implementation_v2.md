@@ -134,8 +134,7 @@ speedup = `flashmla_ms / trtllm_ms`，**大于 1 表示 FlashMLA 更慢**。数�
 | 16 | 32768 | 0.0492 | 0.0205 | 2.40 |
 
 ### 7.1 解读
-- **decode（q_len=1）下 trtllm 快约 2.4~2.75 倍**——在 fp8/fp8 同精度下，再次确认导师 claim
-  "FlashMLA 更慢" **在 decode 区间成立**。
+- **decode（q_len=1）下 trtllm 快约 2.4~2.75 倍**草（——在 fp8/fp8 同精度下）
 - **与阶段 A（trtllm bf16）对比**：flashmla 不变（0.037~0.049，本就 fp8 KV），trtllm 从
   0.016~0.025 → **0.014~0.021**（更快）——fp8 KV 把 KV 读带宽减半的效果。于是 speedup 反而
   **从 ~2.0~2.44 拉大到 ~2.4~2.75**。
