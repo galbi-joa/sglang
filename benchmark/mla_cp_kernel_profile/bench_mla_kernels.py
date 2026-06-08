@@ -563,8 +563,14 @@ def make_flashmla_sparse_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0)
     return run, ""
 
 
-def make_trtllm_sparse_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0):
+def make_trtllm_sparse_prefill(b, s_q, s_kv, h_q, topk, fp8=False, device="cuda", seed=0):
     """trtllm-gen sparse prefill / EXTEND -- the CORRECT V3.2 (DSA) path.
+
+    dtype: pass fp8=True for the real-deployment precision (q+KV both fp8).
+    trtllm CAN run fp8 in prefill, unlike FlashMLA's bf16-only flash_mla_sparse_fwd
+    -- this is what makes the mentor's "trtllm fp8 vs flashmla bf16" comparison the
+    realistic one. trtllm requires q dtype == KV dtype, so when fp8 both are cast.
+
 
     dsa_backend.py:_forward_trtllm (used for DSA prefill with is_prefill=True)
     does NOT call the ragged dense kernel; it calls the SAME absorbed-sparse MLA
@@ -592,6 +598,10 @@ def make_trtllm_sparse_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0):
     nblk = (s_kv + PAGE_SIZE - 1) // PAGE_SIZE
     kv = (torch.randn(nblk, 1, PAGE_SIZE, HEAD_DIM_CKV,
                       dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    if fp8:
+        # q dtype must equal KV dtype for trtllm; cast both to fp8.
+        q = q.to(FP8_DTYPE)
+        kv = kv.to(FP8_DTYPE)
     # block_tables: per (batch, q_row) topk positions into the KV. page_size 1
     # selection like dsa_backend's transformed page table.
     block_tables = torch.randint(0, s_kv, (b, s_q, eff_topk), dtype=torch.int32, device=device)
@@ -613,6 +623,57 @@ def make_trtllm_sparse_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0):
             bmm1_scale=SOFTMAX_SCALE,
             backend="trtllm-gen",
         )
+
+    return run, ""
+
+
+def make_flashmla_kv_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0):
+    """FlashMLA's ONLY fp8 option for prefill: the DECODE kernel
+    (flash_mla_with_kvcache, is_fp8_kvcache=True) reused for prefill by treating
+    each of the b*s_q new tokens as a single-token decode against the full KV --
+    exactly what dsa_backend._forward_flashmla_kv does (q_all.view(-1, 1, H, d),
+    :1792). flash_mla_sparse_fwd is bf16-only, so this is the only fp8 FlashMLA
+    path in the prefill stage. q stays bf16; only the K cache is fp8 (packed via
+    quantize_k_cache), matching FlashMLA's native fp8-decode form."""
+    flash_mla_with_kvcache, get_mla_metadata = try_import_flashmla()
+    if flash_mla_with_kvcache is None:
+        return None, "flashmla unavailable"
+    torch.manual_seed(seed)
+    pad_to = 128 if device_cap()[0] >= 10 else 64
+    h_pad = ((h_q + pad_to - 1) // pad_to) * pad_to
+    rows = b * s_q  # each new token = one single-token "decode" (folded into batch)
+    eff_topk = min(topk, s_kv)
+    nblk = (s_kv + PAGE_SIZE - 1) // PAGE_SIZE
+    # q stays bf16 (FlashMLA fp8 path = bf16 q + fp8 K)
+    q = torch.randn(rows, 1, h_pad, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+    kv = (torch.randn(nblk, PAGE_SIZE, 1, HEAD_DIM_CKV,
+                      dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    kv_q = quantize_k_cache(kv)  # fp8 packed (FlashMLA fp8 KV layout)
+    cache_seqlens = torch.full((rows,), s_kv, dtype=torch.int32, device=device)
+    idx = torch.randint(0, s_kv, (rows, 1, eff_topk), dtype=torch.int32, device=device)
+
+    try:
+        tile_md, num_splits = get_mla_metadata(
+            cache_seqlens, 1 * h_pad // 1, 1, h_pad, True, eff_topk
+        )
+    except Exception as e:  # noqa: BLE001
+        return None, _short_err(e)
+
+    def run():
+        empty_bt = torch.empty((rows, 0), dtype=torch.int32, device=device)
+        out, _ = flash_mla_with_kvcache(
+            q=q,
+            k_cache=kv_q,
+            block_table=empty_bt,
+            cache_seqlens=cache_seqlens,
+            head_dim_v=HEAD_DIM_V,
+            tile_scheduler_metadata=tile_md,
+            num_splits=num_splits,
+            softmax_scale=SOFTMAX_SCALE,
+            is_fp8_kvcache=True,
+            indices=idx,
+        )
+        return out
 
     return run, ""
 
@@ -671,29 +732,36 @@ def _verify_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
 
 
 def run_sparse_prefill(args):
-    """FlashMLA sparse prefill / EXTEND -- the 'FlashMLA kernel doing prefill'
-    path the mentor pointed at, at realistic long-context sizes.
+    """DSA prefill / EXTEND comparison, reproducing the mentor's 3-column table.
 
-    Extend: cached prefix (--cached-len) + new tokens (--seq-q) so that
-    kv_len = cached + new. Under CP the new tokens are sharded across cp_size
-    ranks, so each rank's q is new/cp_size while it still attends to the full
-    (all-gathered) KV -- we measure that per-rank kernel call."""
+    Three backends, each at its REAL deployment precision (which is why the
+    columns are different dtypes -- that asymmetry is the whole point):
+      - trtllm-gen        : fp8 q + fp8 KV  (trtllm CAN run fp8 in prefill)
+      - flashmla_sparse   : bf16            (flash_mla_sparse_fwd is bf16-only)
+      - flashmla_kv       : fp8 KV          (decode kernel reused for prefill --
+                            the ONLY fp8 FlashMLA option in the prefill stage)
+
+    Ratios: sparse/trt = flashmla_sparse / trtllm,  kv/trt = flashmla_kv / trtllm
+    (>1 means FlashMLA slower). Extend: cached (--cached-len) + new (--seq-q),
+    kv_len = cached + new; --cp-size shards the new tokens (q/rank = new/cp)."""
     rows = []
     cp = max(1, args.cp_size)
     cached = args.cached_len
-    print(f"\n=== SPARSE PREFILL / EXTEND (FlashMLA flash_mla_sparse_fwd, "
-          f"cached={cached}, topk={DSA_TOPK}, cp_size={cp}) ===")
-    print(f"{'B':>4} {'NEW':>8} {'CACHED':>8} {'KV_TOT':>8} {'q/rank':>8} {'H':>4} | "
-          f"{'flashmla(ms)':>13} {'trtllm(ms)':>12} {'speedup':>8}")
+    print(f"\n=== SPARSE PREFILL / EXTEND (cached={cached}, topk={DSA_TOPK}, cp_size={cp}) ===")
+    print("precision per column:  trtllm = fp8 (q+KV)  |  flashmla_sparse = bf16 "
+          "(prefill kernel, fp8 N/A)  |  flashmla_kv = fp8 KV (decode kernel as prefill)")
+    print(f"{'B':>4} {'NEW':>7} {'CACHED':>8} {'KV_TOT':>8} {'q/rank':>7} {'H':>4} | "
+          f"{'trtllm_fp8':>11} {'fmla_sparse_bf16':>16} {'fmla_kv_fp8':>12} "
+          f"{'sparse/trt':>10} {'kv/trt':>8}")
     for b in args.batch:
         for new in args.seq_q:
             for h in args.heads:
                 kv_tot = cached + new                 # total KV the query attends to
                 q_per_rank = max(1, new // cp)        # CP shards the new tokens
                 if args.verify:
-                    # numerical cross-check on a SHARED input (smaller q to keep
-                    # the reference cheap); confirms both kernels compute the same
-                    # thing before trusting the timing.
+                    # numerical cross-check on a SHARED input (bf16, smaller q to
+                    # keep the reference cheap); confirms flashmla_sparse and the
+                    # trtllm sparse kernel compute the same thing.
                     v_sq = min(q_per_rank, 256)
                     res = _verify_sparse_prefill(v_sq, min(kv_tot, 8192), h, DSA_TOPK)
                     if isinstance(res, tuple):
@@ -703,18 +771,29 @@ def run_sparse_prefill(args):
                               f"flashmla{sfm} vs trtllm{stg}")
                     else:
                         print(f"    [verify] {res}")
-                fm, fm_note = make_flashmla_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
-                tg, tg_note = make_trtllm_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
-                r_fm = time_kernel("flashmla_sparse_prefill", fm) if fm else TimeResult("flashmla", False, note=fm_note or "unavailable")
-                r_tg = time_kernel("trtllm_sparse_prefill", tg) if tg else TimeResult("trtllm", False, note=tg_note or "unavailable")
-                sp = (r_fm.ms / r_tg.ms) if (r_fm.ok and r_tg.ok) else float("nan")
-                print(f"{b:>4} {new:>8} {cached:>8} {kv_tot:>8} {q_per_rank:>8} {h:>4} | "
-                      f"{_fmt(r_fm):>13} {_fmt(r_tg):>12} {sp:>8.2f}")
-                _print_note_lines(b, f"new={new} cached={cached} cp={cp} H={h}", r_fm, r_tg)
-                rows.append((b, new, cached, h, r_fm, r_tg, sp))
+
+                tg, tg_note = make_trtllm_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK, fp8=True)
+                fs, fs_note = make_flashmla_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
+                fk, fk_note = make_flashmla_kv_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
+                r_tg = time_kernel("trtllm_fp8", tg) if tg else TimeResult("trtllm_fp8", False, note=tg_note or "unavailable")
+                r_fs = time_kernel("fmla_sparse_bf16", fs) if fs else TimeResult("fmla_sparse_bf16", False, note=fs_note or "unavailable")
+                r_fk = time_kernel("fmla_kv_fp8", fk) if fk else TimeResult("fmla_kv_fp8", False, note=fk_note or "unavailable")
+
+                sp_st = (r_fs.ms / r_tg.ms) if (r_fs.ok and r_tg.ok) else float("nan")
+                sp_kt = (r_fk.ms / r_tg.ms) if (r_fk.ok and r_tg.ok) else float("nan")
+                print(f"{b:>4} {new:>7} {cached:>8} {kv_tot:>8} {q_per_rank:>7} {h:>4} | "
+                      f"{_fmt(r_tg):>11} {_fmt(r_fs):>16} {_fmt(r_fk):>12} "
+                      f"{sp_st:>10.2f} {sp_kt:>8.2f}")
+                for r in (r_tg, r_fs, r_fk):
+                    if not r.ok and r.note:
+                        print(f"    [new={new} H={h}] {r.name}: {r.note}")
+                rows.append((b, new, cached, h, r_tg, r_fs, r_fk))
                 _record("sparse_prefill_extend", b, q_per_rank, kv_tot, h,
-                        f"cp{cp}_cached{cached}", r_fm, r_tg,
-                        "flashmla_sparse_prefill", "trtllm_sparse_mla_prefill")
+                        f"cp{cp}_cached{cached}", r_fs, r_tg,
+                        "flashmla_sparse_bf16", "trtllm_fp8")
+                _record("sparse_prefill_kv", b, q_per_rank, kv_tot, h,
+                        f"cp{cp}_cached{cached}", r_fk, r_tg,
+                        "flashmla_kv_fp8", "trtllm_fp8")
     return rows
 
 
@@ -723,7 +802,9 @@ def run_sparse_decode(args):
     can run after the CUDA-13 rebuild) vs trtllm-gen sparse decode."""
     rows = []
     print(f"\n=== SPARSE DECODE (DSA/V3.2, fp8 KV, topk={DSA_TOPK}, q_len=1) ===")
-    print(f"{'B':>4} {'S_K':>7} {'H':>4} | {'flashmla(ms)':>13} {'trtllm(ms)':>12} "
+    print("precision:  flashmla = bf16 q + fp8 K (packed)  |  trtllm = fp8 q + fp8 KV  "
+          "(speedup = flashmla/trtllm)")
+    print(f"{'B':>4} {'S_K':>7} {'H':>4} | {'flashmla_fp8':>13} {'trtllm_fp8':>12} "
           f"{'speedup':>8}")
     for b in args.batch:
         for s_k in args.seq_k:
