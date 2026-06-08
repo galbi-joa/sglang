@@ -91,11 +91,21 @@ python bench_mla_kernels.py --mode decode \
    trtllm decode kernel 固定开销更低，故更快。
 2. **对 KV 长度不敏感**（S_K 4k→32k 时间几乎不变）——稀疏只 attend topk=2048。
 3. **batch 增大 speedup 略收窄**（2.75→2.40）——固定开销被摊薄、计算占比上升。
-4. **dense decode 在 B300 上 flashmla 没有 kernel**：报
+4. **q_len > 1（投机解码等场景）的判断**：FlashMLA 没有原生的 q_len > 1 稀疏 decode kernel。
+   - `flash_mla_with_kvcache`（decode kernel）只接受 q_len=1；q_len > 1 时 SGLang 将每个新
+     token 拆成一条 q_len=1 的 decode，相当于把 b×q_len 条 decode 打包成一次 batch 调用
+     （`_forward_flashmla_kv`，dsa_backend.py:1792）。这正是 §1 中 `fmla_kv_fp8` 列的测法。
+   - 该路径的实测数据见 §3.1：fmla_kv_fp8 比 trtllm fp8 慢 **2.86~3.52×**，比 q_len=1 的
+     2.4~2.75× 还慢——因为每个 token 的 kernel-launch 固定开销被累加，而 trtllm 原生处理
+     整个 q_len 的 GEMM，固定开销只付一次。
+   - FlashMLA 的专用 prefill kernel（`flash_mla_sparse_fwd`，bf16）在 q_len > 1 下可以
+     一次完成，但只有 bf16；与 trtllm fp8 比是 1.7~2.0×，存在 dtype 不对称。
+   - 总结：q_len > 1 时 trtllm 的优势不会缩小，反而在 FlashMLA 的 fp8 路径下更大（3.5×
+     级别），只有 bf16 vs bf16 的 prefill kernel 对比才稍窄（~1.7×）。
+5. **dense decode 在 B300 上 flashmla 没有 kernel**：报
    `Dense decode MLA is only supported on SM90a architecture` → 全部 n/a，仅 trtllm 运行；
    trtllm dense decode 随 batch×seqlen 增长（dense 要读整段 KV）。
-5. decode（小 q_len）trtllm 赢；fp8 prefill 也是 trtllm 赢（因 flashmla prefill 不能 fp8）。
-   在 B300 的 fp8 部署下，**decode 与 prefill 都偏向 trtllm**。
+6. 在 B300 的 fp8 部署下，**q_len=1 和 q_len > 1 的稀疏路径都偏向 trtllm**。
 
 ### 2.3 用到的函数与路径
 **基准代码（`bench_mla_kernels.py`）**
@@ -162,10 +172,12 @@ B300 无 FlashMLA dense decode kernel；trtllm dense decode 随 batch×seqlen �
 
 ## 4. 综合结论
 
-1. **在 B300 的 fp8 部署下，decode 与 prefill 都偏向 trtllm-gen。**
-   - decode（q_len=1，两端 fp8）：trtllm 快 ~2.4~2.75×（固定开销主导）。
-   - prefill（fp8）：trtllm 快 ~1.7~2.0×。根因是 **FlashMLA 的 prefill kernel 只有 bf16**；
-     改用 decode kernel（flashmla_kv）做 fp8 prefill 又会撞共享内存上限而变慢。
+1. **在 B300 的 fp8 部署下，所有测到的路径都偏向 trtllm-gen。**
+   - sparse decode（q_len=1，两端 fp8）：trtllm 快 ~2.4~2.75×（固定开销主导）。
+   - sparse decode（q_len > 1，fp8）：FlashMLA 无原生支持，退化为逐 token decode 拆包
+     → 实测 `fmla_kv_fp8` 慢 **2.86~3.52×**，比 q_len=1 更慢。
+   - prefill（fp8）：trtllm 快 ~1.7~2.0×（最小值）。根因是 FlashMLA 的 prefill kernel
+     只有 bf16；decode kernel 复用做 fp8 prefill 又会撞共享内存上限（B≥16 时）。
 2. **dense decode 在 B300 上 FlashMLA 无 kernel**（SM90a-only）→ n/a，仅 trtllm 可用。
 3. **唯一 flashmla 略占优的情形**是 bf16-vs-bf16 的 prefill（约快 10%），但这不是真实 fp8 部署。
 
