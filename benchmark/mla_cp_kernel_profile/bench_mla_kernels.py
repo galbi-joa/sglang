@@ -788,12 +788,18 @@ def run_sparse_prefill(args):
                     if not r.ok and r.note:
                         print(f"    [new={new} H={h}] {r.name}: {r.note}")
                 rows.append((b, new, cached, h, r_tg, r_fs, r_fk))
-                _record("sparse_prefill_extend", b, q_per_rank, kv_tot, h,
-                        f"cp{cp}_cached{cached}", r_fs, r_tg,
-                        "flashmla_sparse_bf16", "trtllm_fp8")
-                _record("sparse_prefill_kv", b, q_per_rank, kv_tot, h,
-                        f"cp{cp}_cached{cached}", r_fk, r_tg,
-                        "flashmla_kv_fp8", "trtllm_fp8")
+                _record_row(
+                    mode="sparse_prefill", batch=b, NEW=new, CACHED=cached,
+                    KV_TOT=kv_tot, q_per_rank=q_per_rank, heads=h, cp_size=cp,
+                    trtllm_fp8_ms=_csv_ms(r_tg),
+                    flashmla_sparse_bf16_ms=_csv_ms(r_fs),
+                    flashmla_kv_fp8_ms=_csv_ms(r_fk),
+                    sparse_over_trt=_csv_num(sp_st),
+                    kv_over_trt=_csv_num(sp_kt),
+                    notes=_csv_notes(("trtllm_fp8", r_tg),
+                                     ("flashmla_sparse_bf16", r_fs),
+                                     ("flashmla_kv_fp8", r_fk)),
+                )
     return rows
 
 
@@ -837,8 +843,12 @@ def run_sparse_decode(args):
                       f"{sp:>8.2f}")
                 _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, r_tg)
                 rows.append((b, s_k, h, r_fm, r_tg, sp))
-                _record("sparse_decode", b, 1, s_k, h, "fp8kv", r_fm, r_tg,
-                        "flashmla_sparse_decode", "trtllm_sparse_decode")
+                _record_row(
+                    mode="sparse_decode", batch=b, S_K=s_k, heads=h,
+                    flashmla_fp8_ms=_csv_ms(r_fm), trtllm_fp8_ms=_csv_ms(r_tg),
+                    speedup_fmla_over_trt=_csv_num(sp),
+                    notes=_csv_notes(("flashmla_fp8", r_fm), ("trtllm_fp8", r_tg)),
+                )
     return rows
 
 
@@ -900,8 +910,12 @@ def run_decode(args):
                       f"{sp:>8.2f} {cd:>10.2e}")
                 _print_note_lines(b, f"B={b} S_K={s_k} H={h}", r_fm, r_tg)
                 rows.append((b, s_k, h, r_fm, r_tg, sp, cd))
-                _record("decode", b, 1, s_k, h, args.dtype, r_fm, r_tg,
-                        "flashmla_decode", "trtllm_decode", cos=cd)
+                _record_row(
+                    mode="decode", batch=b, S_K=s_k, heads=h, dtype=args.dtype,
+                    flashmla_ms=_csv_ms(r_fm), trtllm_ms=_csv_ms(r_tg),
+                    speedup_fmla_over_trt=_csv_num(sp), cos_diff=_csv_cos(cd),
+                    notes=_csv_notes(("flashmla", r_fm), ("trtllm", r_tg)),
+                )
     return rows
 
 
@@ -925,8 +939,13 @@ def run_prefill_absorbed(args):
                       f"{_fmt(r_tg):>12} {sp:>8.2f} {cd:>10.2e}")
                 _print_note_lines(b, f"B={b} S_Q={s_q} H={h}", r_fm, r_tg)
                 rows.append((b, s_q, h, r_fm, r_tg, sp, cd))
-                _record("prefill_absorbed", b, s_q, s_q, h, args.dtype, r_fm, r_tg,
-                        "flashmla_decode_kernel", "trtllm_decode", cos=cd)
+                _record_row(
+                    mode="prefill_absorbed", batch=b, S_Q=s_q, S_K=s_q, heads=h,
+                    dtype=args.dtype, flashmla_ms=_csv_ms(r_fm),
+                    trtllm_ms=_csv_ms(r_tg), speedup_fmla_over_trt=_csv_num(sp),
+                    cos_diff=_csv_cos(cd),
+                    notes=_csv_notes(("flashmla", r_fm), ("trtllm", r_tg)),
+                )
     return rows
 
 
@@ -967,8 +986,13 @@ def run_prefill_ragged(args):
                 print(f"{b:>4} {s_q:>7} {h:>4} | {_fmt(r_fi):>14} {_fmt(r_tg):>12} "
                       f"{sp:>8.2f} {cd:>10.2e}")
                 rows.append((b, s_q, h, r_fi, r_tg, sp, cd))
-                _record("prefill_ragged", b, s_q, s_q, h, args.dtype, r_fi, r_tg,
-                        "flashinfer_ragged", "trtllm_ragged", cos=cd)
+                _record_row(
+                    mode="prefill_ragged", batch=b, S_Q=s_q, heads=h,
+                    dtype=args.dtype, flashinfer_ragged_ms=_csv_ms(r_fi),
+                    trtllm_ragged_ms=_csv_ms(r_tg),
+                    speedup_fi_over_trt=_csv_num(sp), cos_diff=_csv_cos(cd),
+                    notes=_csv_notes(("flashinfer_ragged", r_fi), ("trtllm_ragged", r_tg)),
+                )
     return rows
 
 
@@ -978,41 +1002,48 @@ def run_prefill_ragged(args):
 _CSV_ROWS: list[dict] = []
 
 
-def _record(mode, b, s_q, s_kv, h, dtype, r_a, r_b,
-            a_name="flashmla", b_name="trtllm", cos=float("nan")):
-    """Append one normalized result row for CSV export.
+def _csv_ms(r: "TimeResult") -> str:
+    """Per-backend latency cell: the ms value, or '' (kept readable in the note)."""
+    return f"{r.ms:.4f}" if r.ok else ""
 
-    r_a / r_b are TimeResult for the two backends being compared in this mode.
-    speedup = a_ms / b_ms (>1 means backend A is slower)."""
-    sp = (r_a.ms / r_b.ms) if (r_a.ok and r_b.ok) else float("nan")
-    _CSV_ROWS.append({
-        "mode": mode,
-        "batch": b,
-        "s_q": s_q,
-        "s_kv": s_kv,
-        "heads": h,
-        "dtype": dtype,
-        "a_backend": a_name,
-        "a_ms": f"{r_a.ms:.4f}" if r_a.ok else "",
-        "a_note": "" if r_a.ok else (r_a.note or "unavailable"),
-        "b_backend": b_name,
-        "b_ms": f"{r_b.ms:.4f}" if r_b.ok else "",
-        "b_note": "" if r_b.ok else (r_b.note or "unavailable"),
-        "speedup_a_over_b": f"{sp:.4f}" if sp == sp else "",  # NaN check
-        "cos_diff": f"{cos:.3e}" if cos == cos else "",
-    })
+
+def _csv_num(x: float) -> str:
+    return f"{x:.4f}" if x == x else ""  # NaN -> ""
+
+
+def _csv_cos(x: float) -> str:
+    return f"{x:.3e}" if x == x else ""
+
+
+def _csv_notes(*named) -> str:
+    """Collect '<backend>: <reason>' for any backend that did not run."""
+    return "; ".join(f"{n}: {r.note}" for n, r in named if not r.ok and r.note)
+
+
+def _record_row(**cols) -> None:
+    """Append ONE wide CSV row per benchmarked shape (mirrors the printed table:
+    one row, one named column per backend's ms, plus the ratios)."""
+    _CSV_ROWS.append(cols)
 
 
 def _write_csv(path):
     import csv
+
     if not _CSV_ROWS:
         print("[csv] no rows to write")
         return
-    fields = list(_CSV_ROWS[0].keys())
+    # Union of keys across all rows, preserving first-seen order, so modes with
+    # different columns (e.g. sparse_prefill's 3 backends) still write cleanly.
+    fields: list[str] = []
+    for row in _CSV_ROWS:
+        for k in row:
+            if k not in fields:
+                fields.append(k)
     with open(path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=fields)
         w.writeheader()
-        w.writerows(_CSV_ROWS)
+        for row in _CSV_ROWS:
+            w.writerow({k: row.get(k, "") for k in fields})
     print(f"\n[csv] wrote {len(_CSV_ROWS)} rows -> {path}")
 
 

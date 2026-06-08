@@ -63,17 +63,31 @@ echo ""
 echo "=== Done. Per-regime logs under $OUT/${STAMP}_*.log ==="
 echo "Per-regime CSVs under $OUT/${STAMP}_*.csv"
 
-# Merge all per-regime CSVs into one combined file (single header).
+# Merge all per-regime CSVs into one combined file. Each regime now has its own
+# named columns (one row per shape), so merge by the UNION of headers (blanks
+# where a column doesn't apply) instead of a naive header-skip concat.
 COMBINED="$OUT/${STAMP}_combined.csv"
-first=1
-for f in "$OUT"/${STAMP}_*.csv; do
-  [ -e "$f" ] || continue
-  if [ $first -eq 1 ]; then
-    cat "$f" > "$COMBINED"; first=0
-  else
-    tail -n +2 "$f" >> "$COMBINED"   # skip header on subsequent files
-  fi
-done
+python - "$COMBINED" "$OUT"/${STAMP}_*.csv <<'PY'
+import csv, sys
+out, files = sys.argv[1], [f for f in sys.argv[2:] if not f.endswith("_combined.csv")]
+rows, fields = [], []
+for fn in files:
+    try:
+        with open(fn, newline="") as f:
+            for row in csv.DictReader(f):
+                rows.append(row)
+                for k in row:
+                    if k not in fields:
+                        fields.append(k)
+    except FileNotFoundError:
+        pass
+if rows:
+    with open(out, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=fields)
+        w.writeheader()
+        for r in rows:
+            w.writerow({k: r.get(k, "") for k in fields})
+PY
 [ -e "$COMBINED" ] && echo "Combined CSV: $COMBINED"
 
 echo "Summary of the headline numbers:"
