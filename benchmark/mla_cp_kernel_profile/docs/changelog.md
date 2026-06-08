@@ -131,8 +131,6 @@ sparse_prefill 两端都用 bf16，本就一致，无需改动。
 ### 1.6 其他
 
 - `--csv`：所有模式可导出统一表格（含每个 backend 的耗时、note、speedup）。
-- `run_all.sh`：一次跑完所有模式并合并出 `*_combined.csv`；sparse_prefill 默认
-  90k cached + 10k new，可用 `CACHED_LEN / NEW_LEN / CP_SIZE` 覆盖。
 
 ## 2. 测试逻辑
 

@@ -52,7 +52,6 @@ this configuration does not exist in a real fp8 deployment.
 
 ```
 bench_mla_kernels.py    main benchmark script
-run_all.sh              full sweep helper (writes per-regime CSVs + combined)
 benchmark_final.md      final results report (Chinese)
 docs/
   benchmarkno1.md         initial analysis and hypothesis write-up
@@ -62,6 +61,7 @@ docs/
   changelog.md            change log
   worklog_2026-06-01.md   day-1 work log (B300 setup, initial findings)
   worklog_2026-06-05.md   day-2 work log (fp8 fix, bug fixes, dispatch verification)
+  worklog_2026-06-08.md   day-3 work log (prefill claim confirmed, docs cleanup)
 ```
 
 ---
@@ -75,6 +75,10 @@ cd benchmark/mla_cp_kernel_profile
 python bench_mla_kernels.py --mode sparse_decode \
     --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --csv sd.csv
 
+# Sparse prefill / extend: batch sweep, 875 new + 69125 cached tokens
+python bench_mla_kernels.py --mode sparse_prefill \
+    --batch 1 2 4 8 16 32 --seq-q 875 --cached-len 69125 --heads 64 --csv prefill.csv
+
 # Sparse prefill / extend: 90k cached + 10k new tokens
 python bench_mla_kernels.py --mode sparse_prefill \
     --batch 1 --seq-q 10000 --cached-len 90000 --heads 128 --csv extend.csv
@@ -86,9 +90,6 @@ python bench_mla_kernels.py --mode sparse_prefill \
 # Dense decode (documents missing FlashMLA kernel on B300 — all n/a)
 python bench_mla_kernels.py --mode decode \
     --batch 1 4 16 --seq-k 4096 16384 32768 --heads 128 --dtype bf16
-
-# Full sweep (all regimes, combined CSV)
-bash run_all.sh
 ```
 
 `--heads` = q-heads after TP (128 for TP=1, 16 for TP=8, etc.).

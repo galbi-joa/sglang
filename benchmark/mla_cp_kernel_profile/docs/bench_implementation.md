@@ -308,8 +308,6 @@ kernel 不可用时 `make_*` 返回 `(None, 原因)`，该行显示 `n/a` 并把
 ## 9. 文件说明
 
 - `bench_mla_kernels.py`：核心微基准，包含上述 5 个模式、timing harness、CSV 导出。
-- `run_all.sh`：一次性跑完所有模式，按模式输出 log 与 CSV，并合并出
-  `<stamp>_combined.csv`。
 - `profile_e2e_cp.sh`：启动真实 DeepSeek 服务（开启 `--enable-prefill-context-parallel`）
   并抓取 torch profiler trace，用于验证微基准是否反映真实部署。
 - `benchmarkno1.md`：记录整个调查的推理过程与背景结论。
