@@ -137,6 +137,37 @@ def try_import_flashinfer():
         return None
 
 
+def try_import_flashmla_standalone():
+    """The STANDALONE `flash_mla` package -- NOT sgl_kernel's vendored copy.
+
+    Built from github.com/galbi-joa/FlashMLA branch `fp8-sparse-prefill`:
+
+        git clone -b fp8-sparse-prefill https://github.com/galbi-joa/FlashMLA.git
+        cd FlashMLA && git submodule update --init csrc/cutlass
+        FLASH_MLA_DISABLE_SM90=1 pip install -v --no-build-isolation .
+
+    It installs as the top-level module `flash_mla`, so it coexists with
+    sgl_kernel (whose copy lives at `sgl_kernel.flash_mla`) -- NO sgl-kernel
+    rebuild needed. The standalone build is deepseek-ai/FlashMLA@main (newer
+    than the sgl-project pin df022eb in flashmla.cmake) plus two fp8 sparse
+    *prefill* paths that sgl_kernel's flash_mla_sparse_fwd lacks:
+
+      * V3.2 cache (656B/token, fp32 scales, d_qk=576): the wrapper detects the
+        656B layout, dequantizes the pool once into a reused bf16 workspace
+        (<1% of the attention's own KV traffic) and runs the bf16 d=576 kernel.
+      * V4/MODEL1 cache (584B/token, e8m0 scales, d_qk=512): a native fp8
+        kernel (PrefillFp8) that TMA-gathers raw fp8 rows + e8m0 scales and
+        dequantizes them in shared memory on the fly.
+    """
+    try:
+        from flash_mla import flash_mla_sparse_fwd as fn
+
+        return fn
+    except Exception as e:  # noqa: BLE001
+        print(f"[skip] standalone flash_mla unavailable: {e}")
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Timing harness: CUDA events, warmup, L2 flush between iters
 # --------------------------------------------------------------------------- #
@@ -678,6 +709,160 @@ def make_flashmla_kv_prefill(b, s_q, s_kv, h_q, topk, device="cuda", seed=0):
     return run, ""
 
 
+# --------------------------------------------------------------------------- #
+# STANDALONE FlashMLA runners (see try_import_flashmla_standalone for install)
+# --------------------------------------------------------------------------- #
+V4_D, V4_D_NOPE = 512, 448  # V4/MODEL1: d_qk = 448 NoPE + 64 RoPE = 512
+
+
+def quantize_k_cache_v4(input_k_cache):
+    """(nblk, block, 1, 512) bf16 -> V4/MODEL1 packed fp8 (nblk, block, 1, 584).
+
+    Per block: block_size token-rows of (448B e4m3 NoPE ++ 128B bf16 RoPE),
+    then block_size scale-rows of (7x e8m0 ++ 1B pad); the block stride is
+    padded to a multiple of 576, as the kernel's TMA requires. Port of
+    FlashMLA tests/quant.py (FP8KVCacheLayout.MODEL1_FP8Sparse). This is the
+    "packed FP8-nope/BF16-rope" cache the dsv4 backend serves V4 with."""
+    nblk, bs, h_k, d = input_k_cache.shape
+    assert h_k == 1 and d == V4_D
+    x = input_k_cache.squeeze(2)
+    padded = (bs * 584 + 575) // 576 * 576
+    out = torch.zeros(nblk, padded, dtype=torch.float8_e4m3fn, device=x.device)
+    body = out[:, :bs * 576].view(nblk, bs, 576)
+    nope, rope = body[..., :448], body[..., 448:].view(torch.bfloat16)
+    scales = out[:, bs*576:bs*584].view(nblk, bs, 8)[..., :7].view(torch.float8_e8m0fnu)
+    rope[:] = x[..., 448:]
+    for t in range(7):
+        sl = slice(t * 64, (t + 1) * 64)
+        inv = (x[..., sl].abs().amax(-1).float() / 448.0).clamp_min(1e-4)
+        inv = torch.pow(2, inv.log2().ceil())  # UE8M0 (power-of-two) scale
+        scales[..., t] = inv.to(torch.float8_e8m0fnu)
+        nope[..., sl] = (x[..., sl].float() / inv.unsqueeze(-1)).to(torch.float8_e4m3fn)
+    return out[:, :bs * 584].view(nblk, bs, 1, 584)  # stride(0)=padded (%576==0)
+
+
+def make_flashmla_sa_sparse_prefill(b, s_q, s_kv, h_q, topk, fp8=False, device="cuda", seed=0):
+    """STANDALONE FlashMLA sparse prefill at the V3.2 shapes (d_qk = 576).
+
+    fp8=False: the same bf16 flash_mla_sparse_fwd call as
+        make_flashmla_sparse_prefill, but through the standalone build.
+        Compared against the fmla_sparse_bf16 column this isolates "newer
+        FlashMLA code" effects from "fp8 format" effects.
+    fp8=True: the V3.2 fp8 path. The standalone flash_mla_sparse_fwd accepts
+        the SAME 656B-per-token V32 cache this file already builds with
+        quantize_k_cache(); it dequantizes the pool into a reused bf16
+        workspace (~1% of the attention's own KV traffic) and runs the bf16
+        d=576 kernel. Same shapes + same cache bytes as the trtllm column, so
+        this is the apples-to-apples FlashMLA-vs-trtllm fp8 prefill row. The
+        timed region includes the per-call (== per-layer) pool dequant,
+        matching the production cost."""
+    fn = try_import_flashmla_standalone()
+    if fn is None:
+        return None, "standalone flash_mla unavailable"
+    torch.manual_seed(seed)
+    h_pad = ((h_q + 127) // 128) * 128
+    rows = b * s_q
+    eff_topk = max(128, min(topk, s_kv) // 128 * 128)  # d=576 kernel: topk % 128 == 0
+    q = (torch.randn(rows, h_pad, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    idx = torch.randint(0, s_kv, (rows, 1, eff_topk), dtype=torch.int32, device=device)
+
+    if not fp8:
+        kv = (torch.randn(s_kv, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+
+        def run():
+            out, _, _ = fn(q, kv, idx, SOFTMAX_SCALE, HEAD_DIM_V)
+            return out
+
+        return run, ""
+
+    nblk = (s_kv + PAGE_SIZE - 1) // PAGE_SIZE
+    kv = (torch.randn(nblk, PAGE_SIZE, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+    kv_q = quantize_k_cache(kv)  # this file's own V32 quantizer (656B/token)
+    ws = torch.empty(nblk, PAGE_SIZE, 1, HEAD_DIM_CKV, dtype=torch.bfloat16, device=device)
+
+    def run():
+        out, _, _ = fn(q, kv_q, idx, SOFTMAX_SCALE, HEAD_DIM_V, dequant_workspace=ws)
+        return out
+
+    return run, ""
+
+
+def make_sparse_prefill_v4(b, s_q, s_kv, h_q, topk, backend, device="cuda", seed=0):
+    """V4/MODEL1-shaped sparse prefill (d_qk = 512 = 448 NoPE + 64 RoPE).
+
+    DeepSeek V4 (sglang attention_backend "dsv4", kv_cache_dtype fp8_e4m3) uses
+    the packed FP8-nope/BF16-rope cache == FlashMLA's MODEL1 format. Backends:
+
+      "sgl_bf16": sgl_kernel's flash_mla_sparse_fwd on a bf16 [s_kv,1,512] KV
+          (the vendored kernel supports d_qk=512). In a real fp8 deployment this
+          baseline requires a dequantized bf16 copy of the cache in HBM.
+      "sa_fp8" : the standalone native fp8 prefill kernel (PrefillFp8) on the
+          packed 584B cache -- raw fp8 + e8m0 scales TMA-gathered and
+          dequantized in shared memory. Requires h=128, topk % 64 == 0.
+      "trtllm" : attempted with kv_lora_rank=448 -- expected to fail dispatch
+          (no trtllm-gen cubin for this head layout); kept so the n/a row
+          documents the gap on the trtllm side."""
+    torch.manual_seed(seed)
+    h_pad = ((h_q + 127) // 128) * 128
+    rows = b * s_q
+    eff_topk = max(128, min(topk, s_kv) // 128 * 128)  # %128 keeps every backend happy
+    nblk = (s_kv + PAGE_SIZE - 1) // PAGE_SIZE
+    s_kv_pad = nblk * PAGE_SIZE
+
+    if backend == "sgl_bf16":
+        try:
+            from sgl_kernel.flash_mla import flash_mla_sparse_fwd as fn
+        except Exception as e:  # noqa: BLE001
+            return None, f"flashmla unavailable: {e}"
+        q = (torch.randn(rows, h_pad, V4_D, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+        kv = (torch.randn(s_kv_pad, 1, V4_D, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+        idx = torch.randint(0, s_kv, (rows, 1, eff_topk), dtype=torch.int32, device=device)
+
+        def run():
+            out, _, _ = fn(q=q, kv=kv, indices=idx, sm_scale=SOFTMAX_SCALE, d_v=V4_D)
+            return out
+
+        return run, ""
+
+    if backend == "sa_fp8":
+        fn = try_import_flashmla_standalone()
+        if fn is None:
+            return None, "standalone flash_mla unavailable"
+        q = (torch.randn(rows, h_pad, V4_D, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+        kv = (torch.randn(nblk, PAGE_SIZE, 1, V4_D, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1)
+        kv_q = quantize_k_cache_v4(kv)
+        idx = torch.randint(0, s_kv, (rows, 1, eff_topk), dtype=torch.int32, device=device)
+
+        def run():
+            out, _, _ = fn(q, kv_q, idx, SOFTMAX_SCALE, V4_D)
+            return out
+
+        return run, ""
+
+    if backend == "trtllm":
+        fi = try_import_flashinfer()
+        if fi is None:
+            return None, "flashinfer unavailable"
+        q = torch.randn(b, s_q, h_pad, V4_D, dtype=torch.bfloat16, device=device).to(FP8_DTYPE)
+        kv = (torch.randn(nblk, 1, PAGE_SIZE, V4_D, dtype=torch.bfloat16, device=device) / 10).clamp_(-1, 1).to(FP8_DTYPE)
+        block_tables = torch.randint(0, s_kv, (b, s_q, eff_topk), dtype=torch.int32, device=device)
+        seq_lens = torch.full((b,), s_kv, dtype=torch.int32, device=device)
+        workspace = torch.empty(256 * 1024 * 1024, dtype=torch.int8, device=device)
+
+        def run():
+            return fi.decode.trtllm_batch_decode_with_kv_cache_mla(
+                query=q, kv_cache=kv, workspace_buffer=workspace,
+                qk_nope_head_dim=QK_NOPE_HEAD_DIM, kv_lora_rank=V4_D_NOPE,
+                qk_rope_head_dim=QK_ROPE_HEAD_DIM, block_tables=block_tables,
+                seq_lens=seq_lens, max_seq_len=int(s_kv),
+                sparse_mla_top_k=eff_topk, bmm1_scale=SOFTMAX_SCALE,
+                backend="trtllm-gen")
+
+        return run, ""
+
+    return None, f"unknown backend {backend}"
+
+
 def _verify_sparse_prefill(s_q, s_kv, h_q, topk, device="cuda", seed=0):
     """Cross-check that flash_mla_sparse_fwd and the trtllm sparse MLA kernel
     compute the SAME thing on a SHARED input: same latent KV, same topk picks,
@@ -749,10 +934,13 @@ def run_sparse_prefill(args):
     cached = args.cached_len
     print(f"\n=== SPARSE PREFILL / EXTEND (cached={cached}, topk={DSA_TOPK}, cp_size={cp}) ===")
     print("precision per column:  trtllm = fp8 (q+KV)  |  flashmla_sparse = bf16 "
-          "(prefill kernel, fp8 N/A)  |  flashmla_kv = fp8 KV (decode kernel as prefill)")
+          "(sgl_kernel prefill kernel, fp8 N/A)  |  flashmla_kv = fp8 KV (decode kernel as prefill)")
+    print("standalone columns:    sa_bf16 = standalone-build bf16 (isolates code-version effects)  |  "
+          "sa_fp8v32 = standalone V3.2 fp8 (fused pool-dequant + bf16 kernel, same 656B cache as trtllm)")
     print(f"{'B':>4} {'NEW':>7} {'CACHED':>8} {'KV_TOT':>8} {'q/rank':>7} {'H':>4} | "
           f"{'trtllm_fp8':>11} {'fmla_sparse_bf16':>16} {'fmla_kv_fp8':>12} "
-          f"{'sparse/trt':>10} {'kv/trt':>8}")
+          f"{'sa_bf16':>9} {'sa_fp8v32':>10} | "
+          f"{'sparse/trt':>10} {'kv/trt':>8} {'sa8/trt':>8}")
     for b in args.batch:
         for new in args.seq_q:
             for h in args.heads:
@@ -775,30 +963,94 @@ def run_sparse_prefill(args):
                 tg, tg_note = make_trtllm_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK, fp8=True)
                 fs, fs_note = make_flashmla_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
                 fk, fk_note = make_flashmla_kv_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK)
+                sb, sb_note = make_flashmla_sa_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK, fp8=False)
+                sf, sf_note = make_flashmla_sa_sparse_prefill(b, q_per_rank, kv_tot, h, DSA_TOPK, fp8=True)
                 r_tg = time_kernel("trtllm_fp8", tg) if tg else TimeResult("trtllm_fp8", False, note=tg_note or "unavailable")
                 r_fs = time_kernel("fmla_sparse_bf16", fs) if fs else TimeResult("fmla_sparse_bf16", False, note=fs_note or "unavailable")
                 r_fk = time_kernel("fmla_kv_fp8", fk) if fk else TimeResult("fmla_kv_fp8", False, note=fk_note or "unavailable")
+                r_sb = time_kernel("sa_bf16", sb) if sb else TimeResult("sa_bf16", False, note=sb_note or "unavailable")
+                r_sf = time_kernel("sa_fp8v32", sf) if sf else TimeResult("sa_fp8v32", False, note=sf_note or "unavailable")
 
                 sp_st = (r_fs.ms / r_tg.ms) if (r_fs.ok and r_tg.ok) else float("nan")
                 sp_kt = (r_fk.ms / r_tg.ms) if (r_fk.ok and r_tg.ok) else float("nan")
+                sp_sf = (r_sf.ms / r_tg.ms) if (r_sf.ok and r_tg.ok) else float("nan")
                 print(f"{b:>4} {new:>7} {cached:>8} {kv_tot:>8} {q_per_rank:>7} {h:>4} | "
                       f"{_fmt(r_tg):>11} {_fmt(r_fs):>16} {_fmt(r_fk):>12} "
-                      f"{sp_st:>10.2f} {sp_kt:>8.2f}")
-                for r in (r_tg, r_fs, r_fk):
+                      f"{_fmt(r_sb):>9} {_fmt(r_sf):>10} | "
+                      f"{sp_st:>10.2f} {sp_kt:>8.2f} {sp_sf:>8.2f}")
+                for r in (r_tg, r_fs, r_fk, r_sb, r_sf):
                     if not r.ok and r.note:
                         print(f"    [new={new} H={h}] {r.name}: {r.note}")
-                rows.append((b, new, cached, h, r_tg, r_fs, r_fk))
+                rows.append((b, new, cached, h, r_tg, r_fs, r_fk, r_sb, r_sf))
                 _record_row(
                     mode="sparse_prefill", batch=b, NEW=new, CACHED=cached,
                     KV_TOT=kv_tot, q_per_rank=q_per_rank, heads=h, cp_size=cp,
                     trtllm_fp8_ms=_csv_ms(r_tg),
                     flashmla_sparse_bf16_ms=_csv_ms(r_fs),
                     flashmla_kv_fp8_ms=_csv_ms(r_fk),
+                    flashmla_sa_bf16_ms=_csv_ms(r_sb),
+                    flashmla_sa_fp8v32_ms=_csv_ms(r_sf),
                     sparse_over_trt=_csv_num(sp_st),
                     kv_over_trt=_csv_num(sp_kt),
+                    sa_fp8_over_trt=_csv_num(sp_sf),
                     notes=_csv_notes(("trtllm_fp8", r_tg),
                                      ("flashmla_sparse_bf16", r_fs),
-                                     ("flashmla_kv_fp8", r_fk)),
+                                     ("flashmla_kv_fp8", r_fk),
+                                     ("flashmla_sa_bf16", r_sb),
+                                     ("flashmla_sa_fp8v32", r_sf)),
+                )
+    return rows
+
+
+def run_sparse_prefill_v4(args):
+    """V4/MODEL1-shaped sparse prefill (d_qk = 512 = 448 NoPE + 64 RoPE).
+
+    DeepSeek V4's dsv4 backend serves a packed FP8-nope/BF16-rope cache
+    (= FlashMLA's MODEL1 format, 584B/token, e8m0 scales). Columns:
+
+      sgl_bf16 : sgl_kernel's bf16 d=512 kernel -- in a real fp8 deployment this
+                 needs a dequantized bf16 cache copy in HBM (the baseline).
+      sa_fp8   : the standalone NATIVE fp8 prefill kernel (PrefillFp8) reading
+                 the packed cache directly (in-smem dequant, no HBM copy).
+      trtllm   : attempted at kv_lora_rank=448; expected n/a (no cubin) --
+                 documents that trtllm-gen currently has no kernel for this shape.
+
+    Use --topk 1024 (or 512) for V4-realistic sweeps; FlashMLA's own MODEL1 perf
+    cases use topk 512-1024 with h_q 64-128."""
+    rows = []
+    cp = max(1, args.cp_size)
+    cached = args.cached_len
+    print(f"\n=== SPARSE PREFILL / EXTEND, V4/MODEL1 SHAPES (d_qk=512, cached={cached}, "
+          f"topk={DSA_TOPK}, cp_size={cp}) ===")
+    print("columns:  sgl_bf16 = sgl_kernel bf16 d=512 (needs bf16 cache copy in fp8 deployment)  |  "
+          "sa_fp8 = standalone native fp8 kernel on the packed 584B cache  |  trtllm: expected n/a")
+    print(f"{'B':>4} {'NEW':>7} {'CACHED':>8} {'KV_TOT':>8} {'q/rank':>7} {'H':>4} | "
+          f"{'trtllm':>8} {'sgl_bf16':>9} {'sa_fp8':>8} | {'fp8/bf16':>9}")
+    for b in args.batch:
+        for new in args.seq_q:
+            for h in args.heads:
+                kv_tot = cached + new
+                q_per_rank = max(1, new // cp)
+                runners = {}
+                for be in ("trtllm", "sgl_bf16", "sa_fp8"):
+                    fn, note = make_sparse_prefill_v4(b, q_per_rank, kv_tot, h, DSA_TOPK, be)
+                    runners[be] = time_kernel(be, fn) if fn else TimeResult(be, False, note=note or "unavailable")
+                r_tg, r_bf, r_f8 = runners["trtllm"], runners["sgl_bf16"], runners["sa_fp8"]
+                ratio = (r_f8.ms / r_bf.ms) if (r_f8.ok and r_bf.ok) else float("nan")
+                print(f"{b:>4} {new:>7} {cached:>8} {kv_tot:>8} {q_per_rank:>7} {h:>4} | "
+                      f"{_fmt(r_tg):>8} {_fmt(r_bf):>9} {_fmt(r_f8):>8} | {ratio:>9.2f}")
+                for r in (r_tg, r_bf, r_f8):
+                    if not r.ok and r.note:
+                        print(f"    [new={new} H={h}] {r.name}: {r.note}")
+                rows.append((b, new, cached, h, r_tg, r_bf, r_f8))
+                _record_row(
+                    mode="sparse_prefill_v4", batch=b, NEW=new, CACHED=cached,
+                    KV_TOT=kv_tot, q_per_rank=q_per_rank, heads=h, cp_size=cp,
+                    trtllm_ms=_csv_ms(r_tg),
+                    sgl_bf16_ms=_csv_ms(r_bf),
+                    sa_fp8_ms=_csv_ms(r_f8),
+                    fp8_over_bf16=_csv_num(ratio),
+                    notes=_csv_notes(("trtllm", r_tg), ("sgl_bf16", r_bf), ("sa_fp8", r_f8)),
                 )
     return rows
 
@@ -1085,13 +1337,15 @@ def main():
     p.add_argument(
         "--mode",
         choices=["decode", "prefill_absorbed", "prefill_ragged",
-                 "sparse_decode", "sparse_prefill", "all"],
+                 "sparse_decode", "sparse_prefill", "sparse_prefill_v4", "all"],
         default="decode",
         help="decode | prefill_absorbed (FlashMLA decode kernel reused for "
         "prefill) | prefill_ragged (pure flashinfer fallback) | sparse_decode "
         "(DSA/V3.2 fp8 sparse decode -- runs on B300) | sparse_prefill "
         "(FlashMLA sparse kernel doing prefill, q_len>1 -- the 'kernel for "
-        "prefill' path) | all",
+        "prefill' path; includes standalone-FlashMLA columns) | "
+        "sparse_prefill_v4 (V4/MODEL1 shapes, d_qk=512: sgl bf16 vs standalone "
+        "native fp8; not part of 'all') | all",
     )
     p.add_argument("--batch", type=int, nargs="+", default=[1, 4, 16])
     p.add_argument("--seq-k", type=int, nargs="+", default=[4096, 16384, 32768],
@@ -1116,7 +1370,14 @@ def main():
     p.add_argument("--verify", action="store_true",
                    help="(sparse_prefill) cross-check both kernels on a shared "
                    "input via cosine diff before timing")
+    p.add_argument("--topk", type=int, default=None,
+                   help="override the sparse top-k (default 2048 = V3.2's DSA "
+                   "indexer top-k; FlashMLA's V4/MODEL1 perf cases use 512-1024)")
     args = p.parse_args()
+
+    if args.topk is not None:
+        global DSA_TOPK
+        DSA_TOPK = args.topk
 
     if not torch.cuda.is_available():
         raise SystemExit("CUDA required. Run on the B300 box.")
@@ -1143,6 +1404,8 @@ def main():
         run_sparse_decode(args)
     if args.mode in ("sparse_prefill", "all"):
         run_sparse_prefill(args)
+    if args.mode == "sparse_prefill_v4":
+        run_sparse_prefill_v4(args)
 
     if args.csv:
         _write_csv(args.csv)

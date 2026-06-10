@@ -106,10 +106,57 @@ python bench_mla_kernels.py --mode decode \
 | `prefill_absorbed` | > 1 | same as decode but causal; FlashMLA decode kernel reused for prefill |
 | `prefill_ragged` | > 1 | `flashinfer` ragged wrapper vs `trtllm_ragged_attention_deepseek` |
 | `sparse_decode` | 1 | `flash_mla_with_kvcache(indices=…, is_fp8_kvcache=True)` vs trtllm sparse |
-| `sparse_prefill` | > 1 | `flash_mla_sparse_fwd` (bf16) + `flashmla_kv` (fp8) vs trtllm fp8 |
+| `sparse_prefill` | > 1 | `flash_mla_sparse_fwd` (bf16) + `flashmla_kv` (fp8) vs trtllm fp8, plus standalone-FlashMLA columns (below) |
+| `sparse_prefill_v4` | > 1 | V4/MODEL1 shapes (d_qk=512): sgl bf16 vs standalone native fp8 vs trtllm (expected n/a) |
 
 `sparse_prefill` is the DSA / V3.2 path and the realistic long-context scenario.
-It outputs three columns: `trtllm_fp8`, `flashmla_sparse_bf16`, `flashmla_kv_fp8`.
+It outputs five columns: `trtllm_fp8`, `flashmla_sparse_bf16`, `flashmla_kv_fp8`,
+`sa_bf16`, `sa_fp8v32`.
+
+---
+
+## Standalone FlashMLA columns (fp8 prefill)
+
+The `sa_*` columns and the `sparse_prefill_v4` mode use the **standalone**
+`flash_mla` package instead of sgl_kernel's vendored copy (which is bf16-only
+for sparse prefill — finding #1 above). No sgl-kernel rebuild is needed; the
+two coexist (`flash_mla` vs `sgl_kernel.flash_mla`):
+
+```bash
+git clone -b fp8-sparse-prefill https://github.com/galbi-joa/FlashMLA.git
+cd FlashMLA && git submodule update --init csrc/cutlass
+FLASH_MLA_DISABLE_SM90=1 pip install -v --no-build-isolation .   # CUDA >= 12.9
+python tests/test_flash_mla_sparse_prefill_fp8_v32.py            # correctness first
+python tests/test_flash_mla_sparse_prefill_fp8.py                # (V4/MODEL1 kernel)
+```
+
+If the package is missing, the new columns just print `n/a` — existing columns
+are unaffected.
+
+- `sa_bf16` — the same bf16 call through the standalone build (deepseek main,
+  newer than the sgl-project pin `df022eb`): isolates code-version effects.
+- `sa_fp8v32` — V3.2 fp8 prefill: the wrapper takes the **same 656B-per-token
+  V32 cache** this script already builds for the other fp8 columns, dequantizes
+  the pool into a reused bf16 workspace (<1% of the attention's own KV traffic)
+  and runs the bf16 d=576 kernel. Same shape + same cache bytes as the trtllm
+  column → the first apples-to-apples FlashMLA-vs-trtllm fp8 prefill row.
+  The timed region includes the per-call (= per-layer) dequant.
+- `sparse_prefill_v4` — DeepSeek V4 ships with `attention_backend=dsv4` and a
+  packed FP8-nope/BF16-rope cache = FlashMLA's MODEL1 format (d_qk = 448+64).
+  The standalone build has a **native** fp8 prefill kernel for it (PrefillFp8:
+  raw fp8 + e8m0 scales TMA-gathered, dequantized in shared memory). trtllm-gen
+  has no kernel for this head layout, so its column documents that gap.
+  V4-realistic sweeps: add `--topk 1024` (or 512).
+
+```bash
+# V3.2 shapes with the standalone columns (same command as before):
+python bench_mla_kernels.py --mode sparse_prefill \
+    --batch 1 --seq-q 10000 --cached-len 90000 --heads 128 --csv extend.csv
+
+# V4/MODEL1 shapes:
+python bench_mla_kernels.py --mode sparse_prefill_v4 \
+    --batch 1 --seq-q 10000 --cached-len 90000 --heads 128 --topk 1024 --csv v4.csv
+```
 
 ---
 
